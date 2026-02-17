@@ -1,1 +1,1 @@
-# macrogpt tests
+# molecule tests

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-macrogpt.py
+molecule.py
 A dependency-free, single-file, async, continually-learning GPT organism.
 
 - Trains on nonames.txt (one sentence per line)
@@ -39,7 +39,7 @@ class Config:
     # data
     corpus_path: str = "nonames.txt"
     db_path: str = "memory.sqlite3"
-    ckpt_path: str = "macrogpt_ckpt.json"
+    ckpt_path: str = "molecule_ckpt.json"
     max_corpus_lines: int = 8000
     max_line_chars: int = 240
 
@@ -1321,7 +1321,7 @@ async def chat_main():
 
     trainer_task = asyncio.create_task(background_trainer(con, model, tok))
 
-    print("macrogpt is alive. Type and press Enter. Ctrl+C to exit.\n")
+    print("molecule is alive. Type and press Enter. Ctrl+C to exit.\n")
     try:
         while True:
             user_text = await asyncio.get_event_loop().run_in_executor(None, input, "> ")

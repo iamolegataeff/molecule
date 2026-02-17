@@ -52,15 +52,15 @@ ENV/
 env.bak/
 venv.bak/
 
-# macrogpt specific
+# molecule specific
 nonames.txt
 memory.sqlite3
-macrogpt_ckpt.json
+molecule_ckpt.json
 *.pkl
 *.npz
 
 # Go build artifacts
-macrogpt_bin
+molecule_bin
 
 # IDE
 .idea/

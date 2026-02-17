@@ -1,4 +1,4 @@
-module github.com/ariannamethod/macrogpt/go
+module github.com/ariannamethod/molecule
 
 go 1.21
 

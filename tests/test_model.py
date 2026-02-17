@@ -10,8 +10,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from macrogpt import (
-    MatrixParam, VectorValue, GPT, EvolvingTokenizer, 
+from molecule import (
+    MatrixParam, VectorValue, GPT, EvolvingTokenizer,
     DeltaAdapter, CFG, backward, rmsnorm, rope_rotate
 )
 

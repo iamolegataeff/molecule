@@ -1,6 +1,6 @@
-// macrogpt.go
+// molecule.go
 // A dependency-free*, single-file, goroutine-powered, continually-learning GPT organism.
-// Go port of macrogpt.py — same architecture, same checkpoint format, 100x faster.
+// Go port of molecule.py — same architecture, same checkpoint format, 100x faster.
 //
 // * "dependency-free" = no PyTorch, no numpy, no C. One Go dep: modernc.org/sqlite (pure Go).
 //
@@ -80,7 +80,7 @@ type Config struct {
 var CFG = Config{
 	CorpusPath:           "nonames.txt",
 	DBPath:               "memory.sqlite3",
-	CkptPath:             "macrogpt_ckpt.json",
+	CkptPath:             "molecule_ckpt.json",
 	MaxCorpusLines:       8000,
 	MaxLineChars:         240,
 	MinNewChars:          480,
@@ -2114,7 +2114,7 @@ func main() {
 	stop := make(chan struct{})
 	go backgroundTrainer(db, model, tok, stop)
 
-	fmt.Println("macrogpt is alive. Type and press Enter. Ctrl+C to exit.\n")
+	fmt.Println("molecule is alive. Type and press Enter. Ctrl+C to exit.\n")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {

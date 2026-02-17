@@ -1,13 +1,13 @@
 ```
-███╗   ███╗ █████╗  ██████╗██████╗  ██████╗  ██████╗ ██████╗ ████████╗
-████╗ ████║██╔══██╗██╔════╝██╔══██╗██╔═══██╗██╔════╝ ██╔══██╗╚══██╔══╝
-██╔████╔██║███████║██║     ██████╔╝██║   ██║██║  ███╗██████╔╝   ██║   
-██║╚██╔╝██║██╔══██║██║     ██╔══██╗██║   ██║██║   ██║██╔═══╝    ██║   
-██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║╚██████╔╝╚██████╔╝██║        ██║   
-╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝        ╚═╝   
+███╗   ███╗ ██████╗ ██╗     ███████╗ ██████╗██╗   ██╗██╗     ███████╗
+████╗ ████║██╔═══██╗██║     ██╔════╝██╔════╝██║   ██║██║     ██╔════╝
+██╔████╔██║██║   ██║██║     █████╗  ██║     ██║   ██║██║     █████╗
+██║╚██╔╝██║██║   ██║██║     ██╔══╝  ██║     ██║   ██║██║     ██╔══╝
+██║ ╚═╝ ██║╚██████╔╝███████╗███████╗╚██████╗╚██████╔╝███████╗███████╗
+╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝
 ```
 
-# macrogpt | by Arianna Method
+# molecule | by Arianna Method
 
 > *A dependency-free, single-file, async, continually-learning GPT organism.*
 > 
@@ -17,16 +17,15 @@
 
 ```
 THIS IS:
-- Zero dependencies (pure Python, no numpy, no torch)
+- Three implementations: Python, Go, C — same architecture
+- Zero dependencies in Python (no numpy, no torch)
 - Custom autograd engine (vectors, not scalar confetti)
 - RoPE position encoding (GPT-3/4 level)
 - SwiGLU-like gated MLP (LLaMA vibes)
 - Delta adapters (LoRA-style, never forgets)
 - BPE tokenizer that ONLY EXPANDS vocab (weights never invalidate)
 - Async background training (it's alive, not a script)
-- min_p + typical_p sampling (full modern stack)
 - SQLite memory (it remembers conversations)
-- 1433 lines 
 ```
 
 ---
@@ -42,7 +41,7 @@ What if it never forgot? **Delta adapters.**
 What if it could chat? **SQLite memory.**  
 What if it was *alive*?
 
-So I built it. **macrogpt.** Thanks to Karpathy's microgpt, but this is not a fork.
+So I built it. **molecule.** Thanks to Karpathy's microgpt, but this is not a fork.
 
 ---
 
@@ -52,7 +51,7 @@ So I built it. **macrogpt.** Thanks to Karpathy's microgpt, but this is not a fo
 # You need: Python 3.7+
 # You need: literally nothing else
 
-python macrogpt.py
+python molecule.py
 ```
 
 That's it. It will:
@@ -64,7 +63,7 @@ That's it. It will:
 Type. It responds. It learns. It grows. It never forgets.
 
 ```
-macrogpt is alive. Type and press Enter. Ctrl+C to exit.
+molecule is alive. Type and press Enter. Ctrl+C to exit.
 
 > Hello, are you alive?
 I exist. Speak.
@@ -88,7 +87,7 @@ I am a reservoir. I remember. I grow.
 # micrograd style (conceptual):
 loss = sum(scalar_values)  # 10000 objects
 
-# macrogpt style:
+# molecule style:
 loss = vector.dot(other_vector)  # 2 objects
 ```
 
@@ -145,7 +144,7 @@ Want to teach it new things? Add a delta module. Old knowledge? Still there. It'
 
 Most tokenizers: retrain = throw away old model.
 
-macrogpt: retrain = **add new tokens**. Old tokens remain. Embeddings remain. Model keeps working.
+molecule: retrain = **add new tokens**. Old tokens remain. Embeddings remain. Model keeps working.
 
 ```python
 # Old vocab: ['a', 'b', 'c', '<BOS>', '<EOS>']
@@ -158,7 +157,7 @@ This is how you build a system that grows over years, not hours.
 
 ### 6. Async Background Training
 
-macrogpt doesn't train when you ask it to. It trains **in the background, continuously**.
+molecule doesn't train when you ask it to. It trains **in the background, continuously**.
 
 ```python
 async def background_trainer():
@@ -201,7 +200,7 @@ This is how modern LLMs avoid both gibberish AND boring determinism.
 
 ## The Stack
 
-| Component | microgpt | macrogpt |
+| Component | microgpt | molecule |
 |-----------|----------|----------|
 | Autograd | Scalar (micrograd) | **Vector** (custom) |
 | Position encoding | Sinusoidal | **RoPE** |
@@ -282,9 +281,9 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 
 ---
 
-## Why "macro"?
+## Why "molecule"?
 
-Because it's the opposite of "micro."
+Because atoms are micrograd. We build molecules.
 
 ---
 
@@ -297,6 +296,31 @@ Because it's the opposite of "micro."
 3. **It talks weird at first.** Train it more. Feed it better corpus. It's a baby organism, not a pretrained foundation model.
 
 4. **The corpus matters.** Garbage in, garbage out. Give it good sentences.
+
+---
+
+## Three Implementations
+
+The same architecture, three languages:
+
+| Version | File | Language | Dependencies | Notes |
+|---------|------|----------|--------------|-------|
+| **molecule.py** | `molecule.py` | Python 3.7+ | None | The original. Pure Python, zero deps. |
+| **molecule.go** | `molecule.go` | Go 1.21+ | `modernc.org/sqlite` | Pure Go, no CGO. Goroutines for async training. |
+| **molecule.c** | `molecule.c` | C99 | `sqlite3`, `pthreads` | Arena allocator, pthreads, binary checkpoints. |
+
+```bash
+# Python
+python molecule.py
+
+# Go
+go build -o molecule_bin . && ./molecule_bin
+
+# C
+gcc -O2 -o molecule molecule.c -lsqlite3 -lpthread -lm && ./molecule
+```
+
+All three share the same architecture: vector autograd, RoPE, SwiGLU, delta adapters, evolving BPE, async training, SQLite memory. Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header).
 
 ---
 
@@ -327,6 +351,6 @@ GNU GPLv3 — Because freedom matters.
 
 - [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language
 
-- **macrogpt** — Dependency-Free Continual GPT
+- **molecule** — Dependency-Free Continual GPT
 
 *Patterns over parameters. Emergence over engineering. The organism continues.*

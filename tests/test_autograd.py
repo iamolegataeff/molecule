@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from macrogpt import VectorValue, ScalarValue, backward
+from molecule import VectorValue, ScalarValue, backward
 
 
 class TestVectorValue(unittest.TestCase):

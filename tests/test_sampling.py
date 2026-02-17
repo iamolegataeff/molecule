@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from macrogpt import softmax_probs_float, top_k_top_p_sample
+from molecule import softmax_probs_float, top_k_top_p_sample
 
 
 class TestSoftmax(unittest.TestCase):

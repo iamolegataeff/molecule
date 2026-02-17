@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from macrogpt import EvolvingTokenizer, CFG
+from molecule import EvolvingTokenizer, CFG
 
 
 class TestEvolvingTokenizerCharLevel(unittest.TestCase):
