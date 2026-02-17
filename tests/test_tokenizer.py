@@ -52,7 +52,7 @@ class TestEvolvingTokenizerCharLevel(unittest.TestCase):
 
     def test_encode_char_level(self):
         """Before BPE, each char should be one token."""
-        text = "abc"
+        text = "fox"
         ids = self.tok.encode(text)
         # BOS + 3 chars + EOS = 5 tokens
         self.assertEqual(len(ids), 5)
