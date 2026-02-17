@@ -16,11 +16,6 @@
 ## TL;DR
 
 ```
-THIS IS NOT:
-- "Another toy GPT implementation"
-- "A weekend project that breaks on Tuesday"
-- "Requires pip install pytorch-mega-transformer-9000"
-
 THIS IS:
 - Zero dependencies (pure Python, no numpy, no torch)
 - Custom autograd engine (vectors, not scalar confetti)
