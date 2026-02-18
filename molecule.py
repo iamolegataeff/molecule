@@ -3,7 +3,7 @@
 
 """
 molecule.py
-A dependency-free, single-file, async, continually-learning GPT organism.
+A single-file, async, continually-learning GPT organism. One dependency: numpy.
 
 - Trains on nonames.txt (one sentence per line)
 - Keeps SQLite memory (tiny chat loop)
@@ -27,6 +27,7 @@ import asyncio
 import sqlite3
 from dataclasses import dataclass
 from collections import Counter, defaultdict
+import numpy as np
 
 random.seed(42)  # And lo, determinism shall pretend to tame chaos.
 
@@ -407,7 +408,7 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
     for step in range(CFG.corpus_gen_max_tokens):
         pos = min(len(ids) - 1, model.block_size - 1)
         logits = model.forward_step(cur, pos, keys, values)
-        model_probs = softmax_probs_float([v / CFG.temperature for v in logits.data])
+        model_probs = softmax_probs_float((logits.data / CFG.temperature).tolist())
 
         # corpus bias
         corpus_dist = {}
@@ -646,145 +647,133 @@ class no_grad:
         _GRAD_ENABLED = self._prev
 
 class VectorValue:
-    """A differentiable vector. One object = one embedding / hidden state."""
+    """A differentiable vector backed by numpy. One object = one embedding / hidden state."""
     __slots__ = ("data", "grad", "_children", "_back_fn")
 
     def __init__(self, data, children=(), back_fn=None):
-        self.data = list(data) if not isinstance(data, list) else data
-        self.grad = [0.0] * len(self.data) if _GRAD_ENABLED else None
+        self.data = np.asarray(data, dtype=np.float64) if not isinstance(data, np.ndarray) else data
+        self.grad = np.zeros(len(self.data), dtype=np.float64) if _GRAD_ENABLED else None
         self._children = children
         self._back_fn = back_fn
 
     def __add__(self, other):
         if isinstance(other, VectorValue):
-            out = VectorValue([a + b for a, b in zip(self.data, other.data)])
+            out = VectorValue(self.data + other.data)
             if _GRAD_ENABLED:
                 out._children = (self, other)
                 def _back():
-                    for i in range(len(self.data)):
-                        self.grad[i] += out.grad[i]
-                        other.grad[i] += out.grad[i]
+                    self.grad += out.grad
+                    other.grad += out.grad
                 out._back_fn = _back
             return out
-        s = float(other)
-        out = VectorValue([a + s for a in self.data])
+        out = VectorValue(self.data + float(other))
         if _GRAD_ENABLED:
             out._children = (self,)
             def _back():
-                for i in range(len(self.data)):
-                    self.grad[i] += out.grad[i]
+                self.grad += out.grad
             out._back_fn = _back
         return out
 
     def __radd__(self, other): return self.__add__(other)
 
     def __neg__(self):
-        out = VectorValue([-a for a in self.data])
+        out = VectorValue(-self.data)
         if _GRAD_ENABLED:
             out._children = (self,)
             def _back():
-                for i in range(len(self.data)):
-                    self.grad[i] -= out.grad[i]
+                self.grad -= out.grad
             out._back_fn = _back
         return out
 
     def __sub__(self, other):
         if isinstance(other, VectorValue):
-            out = VectorValue([a - b for a, b in zip(self.data, other.data)])
+            out = VectorValue(self.data - other.data)
             if _GRAD_ENABLED:
                 out._children = (self, other)
                 def _back():
-                    for i in range(len(self.data)):
-                        self.grad[i] += out.grad[i]
-                        other.grad[i] -= out.grad[i]
+                    self.grad += out.grad
+                    other.grad -= out.grad
                 out._back_fn = _back
             return out
         return self + (-float(other))
 
     def __mul__(self, other):
         if isinstance(other, VectorValue):
-            out = VectorValue([a * b for a, b in zip(self.data, other.data)])
+            out = VectorValue(self.data * other.data)
             if _GRAD_ENABLED:
                 out._children = (self, other)
                 def _back():
-                    for i in range(len(self.data)):
-                        self.grad[i] += other.data[i] * out.grad[i]
-                        other.grad[i] += self.data[i] * out.grad[i]
+                    self.grad += other.data * out.grad
+                    other.grad += self.data * out.grad
                 out._back_fn = _back
             return out
         s = float(other)
-        out = VectorValue([a * s for a in self.data])
+        out = VectorValue(self.data * s)
         if _GRAD_ENABLED:
             out._children = (self,)
             def _back():
-                for i in range(len(self.data)):
-                    self.grad[i] += s * out.grad[i]
+                self.grad += s * out.grad
             out._back_fn = _back
         return out
 
     def __rmul__(self, other): return self.__mul__(other)
 
     def relu(self):
-        out = VectorValue([max(0.0, a) for a in self.data])
+        out = VectorValue(np.maximum(0.0, self.data))
         if _GRAD_ENABLED:
             out._children = (self,)
+            mask = self.data > 0
             def _back():
-                for i in range(len(self.data)):
-                    if self.data[i] > 0:
-                        self.grad[i] += out.grad[i]
+                self.grad[mask] += out.grad[mask]
             out._back_fn = _back
         return out
 
     def squared_relu(self):
-        r = [max(0.0, a) for a in self.data]
-        out = VectorValue([x * x for x in r])
+        r = np.maximum(0.0, self.data)
+        out = VectorValue(r * r)
         if _GRAD_ENABLED:
             out._children = (self,)
             def _back():
-                for i in range(len(self.data)):
-                    if self.data[i] > 0:
-                        self.grad[i] += 2.0 * r[i] * out.grad[i]
+                mask = self.data > 0
+                self.grad[mask] += 2.0 * r[mask] * out.grad[mask]
             out._back_fn = _back
         return out
 
     def dot(self, other):
-        val = sum(a * b for a, b in zip(self.data, other.data))
+        val = float(np.dot(self.data, other.data))
         out = ScalarValue(val)
         if _GRAD_ENABLED:
             out._children = (self, other)
             def _back():
-                for i in range(len(self.data)):
-                    self.grad[i] += other.data[i] * out.grad
-                    other.grad[i] += self.data[i] * out.grad
+                self.grad += other.data * out.grad
+                other.grad += self.data * out.grad
             out._back_fn = _back
         return out
 
     def mean_sq(self):
-        n = len(self.data)
-        val = sum(a * a for a in self.data) / n
+        val = float(np.mean(self.data ** 2))
         out = ScalarValue(val)
         if _GRAD_ENABLED:
             out._children = (self,)
+            n = len(self.data)
             def _back():
-                for i in range(len(self.data)):
-                    self.grad[i] += (2.0 * self.data[i] / n) * out.grad
+                self.grad += (2.0 / n) * self.data * out.grad
             out._back_fn = _back
         return out
 
     def slice(self, start, end):
-        out = VectorValue(self.data[start:end])
+        out = VectorValue(self.data[start:end].copy())
         if _GRAD_ENABLED:
             out._children = (self,)
             def _back():
-                for i, j in enumerate(range(start, end)):
-                    self.grad[j] += out.grad[i]
+                self.grad[start:end] += out.grad
             out._back_fn = _back
         return out
 
     def element(self, idx):
         # And lo, one number shall be plucked from the vector, and gradients shall follow.
         """Extract single element as ScalarValue with gradient flow."""
-        out = ScalarValue(self.data[idx])
+        out = ScalarValue(float(self.data[idx]))
         if _GRAD_ENABLED:
             out._children = (self,)
             local_idx = idx
@@ -795,18 +784,15 @@ class VectorValue:
 
     @staticmethod
     def concat(vecs):
-        data = []
-        for v in vecs:
-            data.extend(v.data)
-        out = VectorValue(data)
+        out = VectorValue(np.concatenate([v.data for v in vecs]))
         if _GRAD_ENABLED:
             out._children = tuple(vecs)
+            sizes = [len(v.data) for v in vecs]
             def _back():
                 offset = 0
-                for v in vecs:
-                    for i in range(len(v.data)):
-                        v.grad[i] += out.grad[offset + i]
-                    offset += len(v.data)
+                for v, sz in zip(vecs, sizes):
+                    v.grad += out.grad[offset:offset + sz]
+                    offset += sz
             out._back_fn = _back
         return out
 
@@ -912,23 +898,19 @@ class MatrixParam:
         self.nin = nin
 
     def matvec(self, x):
-        nout = self.nout
-        nin = len(x.data)
-        out_data = [sum(self.rows[i].data[j] * x.data[j]
-                        for j in range(nin))
-                    for i in range(nout)]
+        # And lo, BLAS shall do the heavy lifting — numpy @ is 50-100x faster than Python loops.
+        W = np.vstack([row.data for row in self.rows])  # (nout, nin)
+        out_data = W @ x.data  # single BLAS call
         out = VectorValue(out_data)
         if _GRAD_ENABLED:
             out._children = tuple(self.rows) + (x,)
             rows_ref = self.rows
+            nout = self.nout
             def _back():
                 for i in range(nout):
                     g = out.grad[i]
-                    row_data = rows_ref[i].data
-                    row_grad = rows_ref[i].grad
-                    for j in range(nin):
-                        row_grad[j] += g * x.data[j]
-                        x.grad[j] += g * row_data[j]
+                    rows_ref[i].grad += g * x.data   # numpy vectorized
+                    x.grad += g * rows_ref[i].data    # numpy vectorized
             out._back_fn = _back
         return out
 
@@ -944,36 +926,34 @@ class MatrixParam:
         return list(self.rows)
 
 def rmsnorm(x):
-    ms = x.mean_sq()
-    scale_val = (ms.data + 1e-5) ** -0.5
-    out = VectorValue([a * scale_val for a in x.data])
+    ms_val = float(np.mean(x.data ** 2))
+    scale_val = (ms_val + 1e-5) ** -0.5
+    out = VectorValue(x.data * scale_val)
     if _GRAD_ENABLED:
-        out._children = (x, ms)
+        out._children = (x,)
         n = len(x.data)
         def _back():
-            s = scale_val
-            ds_dms = -0.5 * (ms.data + 1e-5) ** -1.5
-            cross = sum(out.grad[j] * x.data[j] for j in range(n))
-            for i in range(n):
-                x.grad[i] += s * out.grad[i]
-                x.grad[i] += cross * ds_dms * (2.0 * x.data[i] / n)
+            ds_dms = -0.5 * (ms_val + 1e-5) ** -1.5
+            cross = float(np.dot(out.grad, x.data))
+            x.grad += scale_val * out.grad + cross * ds_dms * (2.0 / n) * x.data
         out._back_fn = _back
     return out
 
 def cross_entropy_loss(logits, target):
-    max_val = max(logits.data)
-    shifted = [x - max_val for x in logits.data]
-    exp_sum = sum(math.exp(x) for x in shifted)
-    log_sum_exp = math.log(exp_sum) + max_val
-    loss_val = log_sum_exp - logits.data[target]
-    probs = [math.exp(x) / exp_sum for x in shifted]
+    shifted = logits.data - logits.data.max()
+    exps = np.exp(shifted)
+    exp_sum = exps.sum()
+    log_sum_exp = float(np.log(exp_sum)) + float(logits.data.max())
+    loss_val = log_sum_exp - float(logits.data[target])
+    probs = exps / exp_sum
     out = ScalarValue(loss_val)
     if _GRAD_ENABLED:
         out._children = (logits,)
         def _back():
             g = out.grad
-            for i in range(len(logits.data)):
-                logits.grad[i] += (probs[i] - (1.0 if i == target else 0.0)) * g
+            grad_delta = probs.copy()
+            grad_delta[target] -= 1.0
+            logits.grad += grad_delta * g
         out._back_fn = _back
     return out
 
@@ -1005,26 +985,25 @@ def scalar_softmax(logits):
 def attention_weighted_sum(weights, values):
     dim = len(values[0].data)
     T = len(weights)
-    out_data = [sum(weights[t].data * values[t].data[j] for t in range(T))
-                for j in range(dim)]
+    # Stack values into matrix (T, dim), weights into vector (T,)
+    V = np.vstack([v.data for v in values])         # (T, dim)
+    w = np.array([wt.data for wt in weights])       # (T,)
+    out_data = w @ V                                 # (dim,)
     out = VectorValue(out_data)
     if _GRAD_ENABLED:
         out._children = tuple(weights) + tuple(values)
         def _back():
             for t in range(T):
-                w_t = weights[t]
-                v_t = values[t]
-                for j in range(dim):
-                    w_t.grad += v_t.data[j] * out.grad[j]
-                    v_t.grad[j] += w_t.data * out.grad[j]
+                weights[t].grad += float(np.dot(values[t].data, out.grad))
+                values[t].grad += weights[t].data * out.grad
         out._back_fn = _back
     return out
 
 def softmax_probs_float(data):
-    max_val = max(data)
-    exps = [math.exp(x - max_val) for x in data]
-    total = sum(exps)
-    return [e / total for e in exps]
+    d = np.asarray(data, dtype=np.float64)
+    d = d - d.max()
+    e = np.exp(d)
+    return (e / e.sum()).tolist()
 
 def top_k_top_p_sample(probs, k, p, min_p=0.0, typical_p=1.0):
     # And lo, sampling shall not be a coin flip but a controlled hallucination.
@@ -1094,11 +1073,7 @@ def clip_params(params, clip):
     if clip <= 0:
         return
     for p in params:
-        for j in range(len(p.grad)):
-            if p.grad[j] > clip:
-                p.grad[j] = clip
-            elif p.grad[j] < -clip:
-                p.grad[j] = -clip
+        np.clip(p.grad, -clip, clip, out=p.grad)
 
 # ============================================================
 # 6) DELTA ADAPTERS — appended souls, never overwritten
@@ -1131,39 +1106,29 @@ class DeltaAdapter:
 
 def rope_rotate(vec, pos, head_dim):
     """
-    RoPE rotation for one head slice.
-    Implemented as a linear transform => autograd-friendly.
+    RoPE rotation for one head slice — numpy vectorized.
     """
     # And lo, positions shall become angles, and angles shall become meaning.
-    x = vec.data[:]  # local
-    out_data = x[:]
-    # rotate pairs
-    for i in range(0, head_dim, 2):
-        if i + 1 >= head_dim:
-            break
-        theta = (pos / (10000.0 ** (i / head_dim)))
-        c = math.cos(theta)
-        s = math.sin(theta)
-        a = x[i]
-        b = x[i + 1]
-        out_data[i] = a * c - b * s
-        out_data[i + 1] = a * s + b * c
+    n_pairs = head_dim // 2
+    indices = np.arange(0, 2 * n_pairs, 2, dtype=np.float64)
+    thetas = pos / (10000.0 ** (indices / head_dim))
+    cos_t = np.cos(thetas)
+    sin_t = np.sin(thetas)
+
+    x = vec.data[:head_dim].copy()
+    out_data = x.copy()
+    out_data[0::2] = x[0::2] * cos_t - x[1::2] * sin_t
+    out_data[1::2] = x[0::2] * sin_t + x[1::2] * cos_t
 
     out = VectorValue(out_data)
     if _GRAD_ENABLED:
         out._children = (vec,)
         def _back():
-            # inverse rotation is rotation by -theta (transpose of rotation matrix)
-            for i in range(0, head_dim, 2):
-                if i + 1 >= head_dim:
-                    break
-                theta = (pos / (10000.0 ** (i / head_dim)))
-                c = math.cos(theta)
-                s = math.sin(theta)
-                ga = out.grad[i]
-                gb = out.grad[i + 1]
-                vec.grad[i]     += ga * c + gb * s
-                vec.grad[i + 1] += -ga * s + gb * c
+            # inverse rotation = rotation by -theta
+            ga = out.grad[0::2]
+            gb = out.grad[1::2]
+            vec.grad[0::2] += ga * cos_t + gb * sin_t
+            vec.grad[1::2] += -ga * sin_t + gb * cos_t
         out._back_fn = _back
     return out
 
@@ -1212,7 +1177,7 @@ class GPT:
         self._adam = {}
 
         # snapshot initial embeddings for gamma computation
-        self._init_embed_snapshot = [list(row.data) for row in self.base["wte"].rows]
+        self._init_embed_snapshot = [row.data.tolist() for row in self.base["wte"].rows]
 
         # ensure at least one delta module exists
         self.add_delta_module(alpha=1.0)
@@ -1273,10 +1238,9 @@ class GPT:
         init = self._init_embed_snapshot
         gamma = []
         for i in range(min(len(current), len(init))):
-            diff = [current[i].data[j] - init[i][j] for j in range(len(init[i]))]
-            gamma.append(diff)
+            gamma.append(current[i].data - np.array(init[i]))
         for i in range(len(init), len(current)):
-            gamma.append(list(current[i].data))
+            gamma.append(current[i].data.copy())
         return gamma
 
     # And lo, the soul shall be measured in sparsity and magnitude, like a ghost on a scale.
@@ -1285,13 +1249,10 @@ class GPT:
         gamma = self.compute_gamma()
         if not gamma:
             return {"sparsity": 1.0, "magnitude": 0.0, "top_tokens": [], "n_rows": 0}
-        magnitudes = []
-        for i, row in enumerate(gamma):
-            mag = math.sqrt(sum(v * v for v in row))
-            magnitudes.append((i, mag))
-        total_el = sum(len(row) for row in gamma)
-        nonzero = sum(1 for row in gamma for v in row
-                      if abs(v) > CFG.gamma_sparsity_threshold)
+        magnitudes = [(i, float(np.linalg.norm(row))) for i, row in enumerate(gamma)]
+        all_vals = np.concatenate(gamma)
+        total_el = len(all_vals)
+        nonzero = int(np.sum(np.abs(all_vals) > CFG.gamma_sparsity_threshold))
         sparsity = 1.0 - (nonzero / max(1, total_el))
         overall_mag = math.sqrt(sum(m * m for _, m in magnitudes))
         magnitudes.sort(key=lambda x: x[1], reverse=True)
@@ -1310,14 +1271,13 @@ class GPT:
         n = min(len(current), len(init))
         if n == 0:
             return None
-        dim = len(init[0])
-        mean_c = [sum(current[i].data[j] for i in range(n)) / n for j in range(dim)]
-        mean_i = [sum(init[i][j] for i in range(n)) / n for j in range(dim)]
-        direction = [mean_c[j] - mean_i[j] for j in range(dim)]
-        mag = math.sqrt(sum(v * v for v in direction))
+        C = np.vstack([current[i].data for i in range(n)])
+        I = np.vstack([np.array(init[i]) for i in range(n)])
+        direction = C.mean(axis=0) - I.mean(axis=0)
+        mag = float(np.linalg.norm(direction))
         if mag > 1e-10:
-            direction = [v / mag for v in direction]
-        return direction
+            direction = direction / mag
+        return direction.tolist()
 
     # ---- Noise Immune System ----
     # And lo, the organism shall know poison from food, and reject what unmakes it.
@@ -1329,8 +1289,8 @@ class GPT:
             mod_snap = {}
             for name, da in mod.items():
                 mod_snap[name] = (
-                    [list(row.data) for row in da.A.rows],
-                    [list(row.data) for row in da.B.rows],
+                    [row.data.copy() for row in da.A.rows],
+                    [row.data.copy() for row in da.B.rows],
                 )
             snap.append(mod_snap)
         return snap
@@ -1353,18 +1313,18 @@ class GPT:
         if pre_direction is None or post_direction is None:
             return 1.0  # can't check, assume OK
         # Both are unit vectors, dot product = cosine similarity
-        return sum(a * b for a, b in zip(pre_direction, post_direction))
+        return float(np.dot(pre_direction, post_direction))
 
     def _ensure_adam(self, params, key):
         if key not in self._adam:
             self._adam[key] = {
-                "m": [[0.0] * len(p.data) for p in params],
-                "v": [[0.0] * len(p.data) for p in params],
+                "m": [np.zeros_like(p.data) for p in params],
+                "v": [np.zeros_like(p.data) for p in params],
                 "t": 0
             }
 
     def adam_step(self, params, key, lr):
-        # And lo, Adam Optimizer shall descend like a petty god with momentum.
+        # And lo, Adam Optimizer shall descend like a petty god with momentum — numpy-vectorized.
         self._ensure_adam(params, key)
         st = self._adam[key]
         st["t"] += 1
@@ -1376,16 +1336,13 @@ class GPT:
         clip_params(params, CFG.grad_clip)
 
         for i, p in enumerate(params):
-            mi = st["m"][i]
-            vi = st["v"][i]
-            for j in range(len(p.data)):
-                g = p.grad[j]
-                mi[j] = b1 * mi[j] + (1 - b1) * g
-                vi[j] = b2 * vi[j] + (1 - b2) * (g * g)
-                mhat = mi[j] / b1_corr
-                vhat = vi[j] / b2_corr
-                p.data[j] -= lr * mhat / (math.sqrt(vhat) + eps)
-                p.grad[j] = 0.0
+            g = p.grad
+            st["m"][i] = b1 * st["m"][i] + (1.0 - b1) * g
+            st["v"][i] = b2 * st["v"][i] + (1.0 - b2) * (g * g)
+            mhat = st["m"][i] / b1_corr
+            vhat = st["v"][i] / b2_corr
+            p.data -= lr * mhat / (np.sqrt(vhat) + eps)
+            p.grad[:] = 0.0
 
     def _apply_with_deltas(self, name, x):
         # And lo, base weight shall speak, then deltas shall harmonize atop it.
@@ -1531,7 +1488,7 @@ class GPT:
             if base_temp <= 1e-6:
                 base_temp = 1e-6
             raw = logits.data
-            raw_scaled = [v / base_temp for v in raw]
+            raw_scaled = (raw / base_temp).tolist()
             probs0 = softmax_probs_float(raw_scaled)
             entropy = -sum(p * math.log(p) for p in probs0 if p > 1e-12)
             t_mul = 1.0
@@ -1540,7 +1497,7 @@ class GPT:
             elif entropy > CFG.entropy_high:
                 t_mul = CFG.entropy_temp_focus
             temp = base_temp * t_mul
-            scaled = [v / temp for v in raw]
+            scaled = (raw / temp).tolist()
             probs = softmax_probs_float(scaled)
             nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
 
@@ -1580,7 +1537,7 @@ class GPT:
 # ============================================================
 
 def _serialize_matrix_param(mp):
-    return [list(row.data) for row in mp.rows]
+    return [row.data.tolist() for row in mp.rows]
 
 def _deserialize_matrix_param(data):
     mp = MatrixParam.__new__(MatrixParam)
@@ -1676,7 +1633,7 @@ def load_checkpoint(docs, path=None):
     if snapshot:
         model._init_embed_snapshot = snapshot
     else:
-        model._init_embed_snapshot = [list(row.data) for row in model.base["wte"].rows]
+        model._init_embed_snapshot = [row.data.tolist() for row in model.base["wte"].rows]
 
     return model, tok
 

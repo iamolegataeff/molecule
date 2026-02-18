@@ -9,6 +9,8 @@ import math
 import sys
 import os
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from molecule import VectorValue, ScalarValue, backward
@@ -17,56 +19,59 @@ from molecule import VectorValue, ScalarValue, backward
 class TestVectorValue(unittest.TestCase):
     """Tests for VectorValue operations."""
 
+    def assertVecEqual(self, vec_data, expected):
+        np.testing.assert_array_almost_equal(vec_data, expected)
+
     def test_add_vectors(self):
         """Vector addition should work correctly."""
         a = VectorValue([1.0, 2.0, 3.0])
         b = VectorValue([4.0, 5.0, 6.0])
         c = a + b
-        self.assertEqual(c.data, [5.0, 7.0, 9.0])
+        self.assertVecEqual(c.data, [5.0, 7.0, 9.0])
 
     def test_add_scalar(self):
         """Vector + scalar should add to all elements."""
         a = VectorValue([1.0, 2.0, 3.0])
         c = a + 10.0
-        self.assertEqual(c.data, [11.0, 12.0, 13.0])
+        self.assertVecEqual(c.data, [11.0, 12.0, 13.0])
 
     def test_sub_vectors(self):
         """Vector subtraction should work correctly."""
         a = VectorValue([5.0, 7.0, 9.0])
         b = VectorValue([1.0, 2.0, 3.0])
         c = a - b
-        self.assertEqual(c.data, [4.0, 5.0, 6.0])
+        self.assertVecEqual(c.data, [4.0, 5.0, 6.0])
 
     def test_mul_vectors(self):
         """Element-wise vector multiplication."""
         a = VectorValue([2.0, 3.0, 4.0])
         b = VectorValue([1.0, 2.0, 3.0])
         c = a * b
-        self.assertEqual(c.data, [2.0, 6.0, 12.0])
+        self.assertVecEqual(c.data, [2.0, 6.0, 12.0])
 
     def test_mul_scalar(self):
         """Vector * scalar should scale all elements."""
         a = VectorValue([1.0, 2.0, 3.0])
         c = a * 2.0
-        self.assertEqual(c.data, [2.0, 4.0, 6.0])
+        self.assertVecEqual(c.data, [2.0, 4.0, 6.0])
 
     def test_neg(self):
         """Negation should flip signs."""
         a = VectorValue([1.0, -2.0, 3.0])
         c = -a
-        self.assertEqual(c.data, [-1.0, 2.0, -3.0])
+        self.assertVecEqual(c.data, [-1.0, 2.0, -3.0])
 
     def test_relu(self):
         """ReLU should zero out negative values."""
         a = VectorValue([-1.0, 0.0, 2.0, -3.0, 4.0])
         c = a.relu()
-        self.assertEqual(c.data, [0.0, 0.0, 2.0, 0.0, 4.0])
+        self.assertVecEqual(c.data, [0.0, 0.0, 2.0, 0.0, 4.0])
 
     def test_squared_relu(self):
         """Squared ReLU should square positive values, zero negatives."""
         a = VectorValue([-1.0, 0.0, 2.0, 3.0])
         c = a.squared_relu()
-        self.assertEqual(c.data, [0.0, 0.0, 4.0, 9.0])
+        self.assertVecEqual(c.data, [0.0, 0.0, 4.0, 9.0])
 
     def test_dot_product(self):
         """Dot product should sum element-wise products."""
@@ -86,14 +91,14 @@ class TestVectorValue(unittest.TestCase):
         """Slice should extract a subvector."""
         a = VectorValue([1.0, 2.0, 3.0, 4.0, 5.0])
         c = a.slice(1, 4)
-        self.assertEqual(c.data, [2.0, 3.0, 4.0])
+        self.assertVecEqual(c.data, [2.0, 3.0, 4.0])
 
     def test_concat(self):
         """Concat should join vectors."""
         a = VectorValue([1.0, 2.0])
         b = VectorValue([3.0, 4.0, 5.0])
         c = VectorValue.concat([a, b])
-        self.assertEqual(c.data, [1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertVecEqual(c.data, [1.0, 2.0, 3.0, 4.0, 5.0])
 
 
 class TestScalarValue(unittest.TestCase):
@@ -124,6 +129,9 @@ class TestScalarValue(unittest.TestCase):
 class TestBackward(unittest.TestCase):
     """Tests for backward pass / gradient computation."""
 
+    def assertVecEqual(self, vec_data, expected):
+        np.testing.assert_array_almost_equal(vec_data, expected)
+
     def test_simple_add_grad(self):
         """Gradient of sum should flow to both inputs."""
         a = VectorValue([1.0, 2.0])
@@ -131,8 +139,8 @@ class TestBackward(unittest.TestCase):
         c = a + b
         s = c.dot(VectorValue([1.0, 1.0]))  # Sum all elements
         backward(s)
-        self.assertEqual(a.grad, [1.0, 1.0])
-        self.assertEqual(b.grad, [1.0, 1.0])
+        self.assertVecEqual(a.grad, [1.0, 1.0])
+        self.assertVecEqual(b.grad, [1.0, 1.0])
 
     def test_mul_grad(self):
         """Gradient of product."""
@@ -142,8 +150,8 @@ class TestBackward(unittest.TestCase):
         s = c.dot(VectorValue([1.0, 1.0]))
         backward(s)
         # d(a*b)/da = b
-        self.assertEqual(a.grad, [4.0, 5.0])
-        self.assertEqual(b.grad, [2.0, 3.0])
+        self.assertVecEqual(a.grad, [4.0, 5.0])
+        self.assertVecEqual(b.grad, [2.0, 3.0])
 
     def test_relu_grad(self):
         """ReLU gradient: 1 for positive, 0 for negative."""
@@ -151,7 +159,7 @@ class TestBackward(unittest.TestCase):
         c = a.relu()
         s = c.dot(VectorValue([1.0, 1.0, 1.0, 1.0]))
         backward(s)
-        self.assertEqual(a.grad, [0.0, 1.0, 0.0, 1.0])
+        self.assertVecEqual(a.grad, [0.0, 1.0, 0.0, 1.0])
 
     def test_chain_grad(self):
         """Chain rule: (a + b) * c."""
