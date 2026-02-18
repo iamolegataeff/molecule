@@ -18,9 +18,11 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -1025,7 +1027,7 @@ func (da *DeltaAdapter) Params() []*Vec {
 }
 
 // ============================================================
-// 4) TOKENIZER — char first, then BPE that only EXPANDS vocab
+// 4) TOKENIZER — byte-level BPE (GPT-3/4 style)
 // ============================================================
 
 type MergePair struct {
@@ -1050,17 +1052,11 @@ type EvolvingTokenizer struct {
 }
 
 func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
-	baseText := strings.Join(docs, "\n") + "\n"
-
-	charSet := make(map[rune]bool)
-	for _, ch := range baseText {
-		charSet[ch] = true
+	// Count trained chars from docs (byte-level: count bytes, not runes)
+	totalChars := 0
+	for _, d := range docs {
+		totalChars += len(d)
 	}
-	chars := make([]string, 0, len(charSet))
-	for ch := range charSet {
-		chars = append(chars, string(ch))
-	}
-	sort.Strings(chars)
 
 	tok := &EvolvingTokenizer{
 		BOS:          "<BOS>",
@@ -1069,12 +1065,19 @@ func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
 		Stoi:         make(map[string]int),
 		Itos:         make(map[int]string),
 		MergeToTok:   make(map[MergePair]string),
-		TrainedChars: len(baseText),
+		TrainedChars: totalChars,
 	}
 
-	tok.Tokens = append(tok.Tokens, chars...)
-	tok.Tokens = append(tok.Tokens, tok.PAD, tok.BOS, tok.EOS)
+	// Fixed 259 tokens: 256 byte tokens + BOS + EOS + PAD
+	tokens := make([]string, 256+3)
+	for i := 0; i < 256; i++ {
+		tokens[i] = fmt.Sprintf("0x%02x", i)
+	}
+	tokens[256] = tok.BOS
+	tokens[257] = tok.EOS
+	tokens[258] = tok.PAD
 
+	tok.Tokens = tokens
 	for i, t := range tok.Tokens {
 		tok.Stoi[t] = i
 		tok.Itos[i] = t
@@ -1083,13 +1086,65 @@ func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
 	return tok
 }
 
-func (t *EvolvingTokenizer) wordToSymbols(word string) []string {
-	syms := make([]string, 0, len([]rune(word))+1)
-	for _, ch := range word {
-		syms = append(syms, string(ch))
+// unicodeSegment splits text into segments by Unicode category.
+// Letters+marks → 'L', digits → 'N', whitespace → 'Z', everything else → 'P'.
+// Each segment is returned as its raw UTF-8 bytes.
+func unicodeSegment(text string) [][]byte {
+	if len(text) == 0 {
+		return nil
 	}
-	syms = append(syms, "</w>")
-	return syms
+	runeCategory := func(r rune) byte {
+		if unicode.IsLetter(r) || unicode.IsMark(r) {
+			return 'L'
+		}
+		if unicode.IsDigit(r) {
+			return 'N'
+		}
+		if unicode.IsSpace(r) {
+			return 'Z'
+		}
+		return 'P'
+	}
+	var segments [][]byte
+	var cur []byte
+	var curCat byte
+	for i, r := range text {
+		cat := runeCategory(r)
+		if i == 0 {
+			curCat = cat
+		}
+		if cat != curCat {
+			segments = append(segments, cur)
+			cur = nil
+			curCat = cat
+		}
+		cur = append(cur, []byte(string(r))...)
+	}
+	if len(cur) > 0 {
+		segments = append(segments, cur)
+	}
+	return segments
+}
+
+// tokenToBytes converts a byte-level BPE token name back to raw bytes.
+// "0xNN" → single byte, "0x48+0x65" → two bytes, etc.
+func tokenToBytes(tok string) []byte {
+	if !strings.Contains(tok, "+") && strings.HasPrefix(tok, "0x") && len(tok) == 4 {
+		b, _ := strconv.ParseUint(tok[2:], 16, 8)
+		return []byte{byte(b)}
+	}
+	if strings.Contains(tok, "+") {
+		parts := strings.Split(tok, "+")
+		result := make([]byte, 0, len(parts))
+		for _, p := range parts {
+			if strings.HasPrefix(p, "0x") && len(p) == 4 {
+				b, _ := strconv.ParseUint(p[2:], 16, 8)
+				result = append(result, byte(b))
+			}
+		}
+		return result
+	}
+	return nil
 }
 
 func (t *EvolvingTokenizer) MaybeEnableBPE(docs []string) bool {
@@ -1124,18 +1179,25 @@ func (t *EvolvingTokenizer) MaybeRetrainBPE(docs []string) bool {
 
 func (t *EvolvingTokenizer) TrainBPE(docs []string, numMerges int) {
 	text := strings.Join(docs, " ")
-	words := strings.Fields(text)
-	if len(words) == 0 {
+	if len(text) == 0 {
 		return
 	}
 
-	// Build vocab: tuple of symbols -> frequency
-	type symKey string
-	vocab := make(map[string]int) // key = JSON-serialized symbol sequence
+	// Split text into Unicode segments, convert each to byte-token sequences
+	segments := unicodeSegment(text)
+	if len(segments) == 0 {
+		return
+	}
+
+	// Build vocab: token sequence → frequency
+	vocab := make(map[string]int)    // key = null-separated token names
 	symSeqs := make(map[string][]string)
 
-	for _, w := range words {
-		syms := t.wordToSymbols(w)
+	for _, seg := range segments {
+		syms := make([]string, len(seg))
+		for i, b := range seg {
+			syms[i] = fmt.Sprintf("0x%02x", b)
+		}
 		key := encodeSyms(syms)
 		vocab[key]++
 		symSeqs[key] = syms
@@ -1168,7 +1230,7 @@ func (t *EvolvingTokenizer) TrainBPE(docs []string, numMerges int) {
 			}
 		}
 
-		newTok := best.A + best.B
+		newTok := best.A + "+" + best.B
 		merges = append(merges, best)
 		mergeToTok[best] = newTok
 
@@ -1216,23 +1278,21 @@ func encodeSyms(syms []string) string {
 	return strings.Join(syms, "\x00")
 }
 
-func (t *EvolvingTokenizer) applyBPEToWord(word string) []string {
-	symbols := t.wordToSymbols(word)
-
+func (t *EvolvingTokenizer) applyBPE(tokens []string) []string {
 	rank := make(map[MergePair]int)
 	for i, p := range t.Merges {
 		rank[p] = i
 	}
 
-	for {
-		if len(symbols) < 2 {
-			break
-		}
-		bestRank := int(1e9)
+	symbols := make([]string, len(tokens))
+	copy(symbols, tokens)
+
+	for len(symbols) >= 2 {
+		bestRank := 1 << 30
 		bestIdx := -1
 		for i := 0; i < len(symbols)-1; i++ {
-			p := MergePair{symbols[i], symbols[i+1]}
-			if r, ok := rank[p]; ok && r < bestRank {
+			key := MergePair{symbols[i], symbols[i+1]}
+			if r, ok := rank[key]; ok && r < bestRank {
 				bestRank = r
 				bestIdx = i
 			}
@@ -1240,11 +1300,11 @@ func (t *EvolvingTokenizer) applyBPEToWord(word string) []string {
 		if bestIdx == -1 {
 			break
 		}
-		p := MergePair{symbols[bestIdx], symbols[bestIdx+1]}
-		newTok := t.MergeToTok[p]
+		pair := MergePair{symbols[bestIdx], symbols[bestIdx+1]}
+		merged := t.MergeToTok[pair]
 		newSymbols := make([]string, 0, len(symbols)-1)
 		newSymbols = append(newSymbols, symbols[:bestIdx]...)
-		newSymbols = append(newSymbols, newTok)
+		newSymbols = append(newSymbols, merged)
 		newSymbols = append(newSymbols, symbols[bestIdx+2:]...)
 		symbols = newSymbols
 	}
@@ -1255,31 +1315,20 @@ func (t *EvolvingTokenizer) Encode(s string) []int {
 	s = strings.TrimSpace(s)
 	ids := []int{t.Stoi[t.BOS]}
 
-	if !t.BPEEnabled {
-		for _, ch := range s {
-			cs := string(ch)
-			if id, ok := t.Stoi[cs]; ok {
-				ids = append(ids, id)
-			}
+	segments := unicodeSegment(s)
+	for _, seg := range segments {
+		// Convert bytes to base token names
+		baseTokens := make([]string, len(seg))
+		for i, b := range seg {
+			baseTokens[i] = fmt.Sprintf("0x%02x", b)
 		}
-		ids = append(ids, t.Stoi[t.EOS])
-		return ids
-	}
-
-	// BPE mode
-	words := strings.Fields(s)
-	for wi, w := range words {
-		syms := t.applyBPEToWord(w)
-		for _, tok := range syms {
-			if tok == "</w>" {
-				continue
-			}
+		// Apply BPE merges if enabled
+		if t.BPEEnabled {
+			baseTokens = t.applyBPE(baseTokens)
+		}
+		// Look up each token in stoi
+		for _, tok := range baseTokens {
 			if id, ok := t.Stoi[tok]; ok {
-				ids = append(ids, id)
-			}
-		}
-		if wi != len(words)-1 {
-			if id, ok := t.Stoi[" "]; ok {
 				ids = append(ids, id)
 			}
 		}
@@ -1289,7 +1338,7 @@ func (t *EvolvingTokenizer) Encode(s string) []int {
 }
 
 func (t *EvolvingTokenizer) Decode(ids []int) string {
-	var out strings.Builder
+	var rawBytes []byte
 	for _, id := range ids {
 		tok := t.Itos[id]
 		if tok == t.BOS || tok == t.PAD {
@@ -1298,11 +1347,12 @@ func (t *EvolvingTokenizer) Decode(ids []int) string {
 		if tok == t.EOS {
 			break
 		}
-		out.WriteString(tok)
+		b := tokenToBytes(tok)
+		if b != nil {
+			rawBytes = append(rawBytes, b...)
+		}
 	}
-	s := out.String()
-	s = strings.ReplaceAll(s, "</w>", "")
-	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+	return strings.TrimSpace(string(rawBytes))
 }
 
 // ============================================================
@@ -2802,7 +2852,7 @@ func LoadCheckpoint(docs []string, path string) (*GPT, *EvolvingTokenizer, error
 		if len(m) == 2 {
 			p := MergePair{m[0], m[1]}
 			tok.Merges = append(tok.Merges, p)
-			tok.MergeToTok[p] = m[0] + m[1]
+			tok.MergeToTok[p] = m[0] + "+" + m[1]
 		}
 	}
 	tok.BPEEnabled = ckpt.Tokenizer.BPEEnabled

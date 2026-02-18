@@ -1079,7 +1079,7 @@ static Node *delta_apply(DeltaAdapter *d, Node *x) {
 }
 
 /* ============================================================
- * 5) TOKENIZER — char first, then BPE
+ * 5) TOKENIZER — byte-level BPE (GPT-3/4 style)
  * ============================================================ */
 
 typedef struct { char a[64]; char b[64]; } MergePair;
@@ -1144,31 +1144,32 @@ static EvolvingTokenizer *tok_new(const char **docs, int n_docs) {
     tok->cap = 512;
     tok->tokens = calloc(tok->cap, sizeof(char*));
 
-    /* Collect unique chars */
-    int seen[256] = {0};
+    /* 256 byte tokens: "0x00" through "0xff" */
+    for (int i = 0; i < 256; i++) {
+        char hex[8];
+        snprintf(hex, sizeof(hex), "0x%02x", i);
+        tok->tokens[tok->vocab_size] = strdup(hex);
+        stoi_put(tok->stoi, hex, tok->vocab_size);
+        tok->vocab_size++;
+    }
+
+    /* Special tokens: BOS (256), EOS (257), PAD (258) */
+    tok->tokens[tok->vocab_size] = strdup("<BOS>");
+    stoi_put(tok->stoi, "<BOS>", tok->vocab_size);
+    tok->bos_id = tok->vocab_size++;
+
+    tok->tokens[tok->vocab_size] = strdup("<EOS>");
+    stoi_put(tok->stoi, "<EOS>", tok->vocab_size);
+    tok->eos_id = tok->vocab_size++;
+
+    tok->tokens[tok->vocab_size] = strdup("<PAD>");
+    stoi_put(tok->stoi, "<PAD>", tok->vocab_size);
+    tok->pad_id = tok->vocab_size++;
+
+    /* docs only used for trained_chars count */
+    tok->trained_chars = 0;
     for (int d = 0; d < n_docs; d++)
-        for (const char *p = docs[d]; *p; p++) seen[(unsigned char)*p] = 1;
-    seen[(unsigned char)'\n'] = 1;
-
-    /* Sort chars */
-    for (int c = 0; c < 256; c++) {
-        if (!seen[c]) continue;
-        char s[2] = {(char)c, 0};
-        tok->tokens[tok->vocab_size] = strdup(s);
-        stoi_put(tok->stoi, s, tok->vocab_size);
-        tok->vocab_size++;
-    }
-
-    /* Special tokens */
-    const char *specials[] = {"<PAD>", "<BOS>", "<EOS>"};
-    for (int i = 0; i < 3; i++) {
-        tok->tokens[tok->vocab_size] = strdup(specials[i]);
-        stoi_put(tok->stoi, specials[i], tok->vocab_size);
-        if (i == 0) tok->pad_id = tok->vocab_size;
-        if (i == 1) tok->bos_id = tok->vocab_size;
-        if (i == 2) tok->eos_id = tok->vocab_size;
-        tok->vocab_size++;
-    }
+        tok->trained_chars += (int)strlen(docs[d]);
 
     return tok;
 }
@@ -1182,6 +1183,79 @@ static void tok_add_token(EvolvingTokenizer *tok, const char *s) {
     tok->tokens[tok->vocab_size] = strdup(s);
     stoi_put(tok->stoi, s, tok->vocab_size);
     tok->vocab_size++;
+}
+
+/* ---- Unicode pre-segmentation ---- */
+
+/* A single byte-buffer segment */
+typedef struct { unsigned char *data; int len; } ByteSeg;
+typedef struct { ByteSeg *segs; int len, cap; } SegArr;
+
+static void segarr_push(SegArr *a, unsigned char *data, int len) {
+    if (a->len >= a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 32;
+        a->segs = realloc(a->segs, sizeof(ByteSeg) * a->cap);
+    }
+    a->segs[a->len].data = malloc(len);
+    memcpy(a->segs[a->len].data, data, len);
+    a->segs[a->len].len = len;
+    a->len++;
+}
+
+static void segarr_free(SegArr *a) {
+    for (int i = 0; i < a->len; i++) free(a->segs[i].data);
+    free(a->segs);
+    a->segs = NULL; a->len = a->cap = 0;
+}
+
+/* Classify a byte into a Unicode category group:
+ * 'L' = letter (ASCII a-z, A-Z, or multi-byte UTF-8 lead bytes)
+ * 'N' = digit (0-9)
+ * 'Z' = whitespace (space, \n, \r, \t)
+ * 'P' = punctuation / everything else
+ * For multi-byte UTF-8, the lead byte determines the group (all 'L'),
+ * and continuation bytes (0x80-0xBF) inherit the group of their lead. */
+static char byte_category(unsigned char b) {
+    if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')) return 'L';
+    if (b >= '0' && b <= '9') return 'N';
+    if (b == ' ' || b == '\n' || b == '\r' || b == '\t') return 'Z';
+    /* Multi-byte UTF-8 lead bytes → treat as letter */
+    if (b >= 0xC0 && b <= 0xF7) return 'L';
+    /* Continuation bytes (0x80-0xBF) → treat as letter (part of multi-byte char) */
+    if (b >= 0x80 && b <= 0xBF) return 'L';
+    return 'P';
+}
+
+/* Split text into segments by Unicode category boundary.
+ * Each segment is a run of bytes sharing the same category group. */
+static SegArr unicode_segment(const char *text) {
+    SegArr result = {0};
+    if (!text || !*text) return result;
+
+    unsigned char buf[4096];
+    int buf_len = 0;
+    char cur_cat = 0;
+
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        char cat = byte_category(*p);
+        if (cat != cur_cat && buf_len > 0) {
+            segarr_push(&result, buf, buf_len);
+            buf_len = 0;
+        }
+        cur_cat = cat;
+        if (buf_len < (int)sizeof(buf) - 1) {
+            buf[buf_len++] = *p;
+        } else {
+            /* Flush oversized segment */
+            segarr_push(&result, buf, buf_len);
+            buf_len = 0;
+            buf[buf_len++] = *p;
+        }
+    }
+    if (buf_len > 0) {
+        segarr_push(&result, buf, buf_len);
+    }
+    return result;
 }
 
 /* ---- BPE Training and Application ---- */
@@ -1199,41 +1273,35 @@ static unsigned int pair_hash(const char *a, const char *b) {
 }
 
 static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs, int num_merges) {
-    /* Build word list from docs */
-    StrArr words = {0};
+    /* Build full text from docs */
+    size_t total_len = 0;
+    for (int d = 0; d < n_docs; d++) total_len += strlen(docs[d]) + 1;
+    char *text = calloc(total_len + 1, 1);
     for (int d = 0; d < n_docs; d++) {
-        const char *p = docs[d];
-        while (*p) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            const char *start = p;
-            while (*p && *p != ' ') p++;
-            int wlen = (int)(p - start);
-            if (wlen > 0 && wlen < 200) {
-                char *w = malloc(wlen + 1);
-                memcpy(w, start, wlen); w[wlen] = 0;
-                sa_push(&words, w);
-                free(w);
-            }
+        if (d > 0) strcat(text, " ");
+        strcat(text, docs[d]);
+    }
+    if (!*text) { free(text); return; }
+
+    /* Segment text into Unicode category runs */
+    SegArr segs = unicode_segment(text);
+    free(text);
+    if (segs.len == 0) { segarr_free(&segs); return; }
+
+    /* Convert segments to byte-token sequences and count frequencies.
+     * We use StrArr per unique segment, with frequency counts. */
+    int total_segs = segs.len;
+    StrArr *sym_seqs = calloc(total_segs, sizeof(StrArr));
+    int *seg_freq = calloc(total_segs, sizeof(int));
+    for (int s = 0; s < total_segs; s++) {
+        seg_freq[s] = 1;
+        for (int b = 0; b < segs.segs[s].len; b++) {
+            char hex[8];
+            snprintf(hex, sizeof(hex), "0x%02x", segs.segs[s].data[b]);
+            sa_push(&sym_seqs[s], hex);
         }
     }
-    if (words.len == 0) { sa_free(&words); return; }
-
-    /* Build symbol sequences per word: each char + </w> marker.
-     * Represent as StrArr per word, stored flat with sentinel. */
-    int total_words = words.len;
-
-    /* Use arrays of StrArr for symbol sequences */
-    StrArr *sym_seqs = calloc(total_words, sizeof(StrArr));
-    int *word_freq = calloc(total_words, sizeof(int));
-    for (int w = 0; w < total_words; w++) {
-        word_freq[w] = 1;
-        for (const char *p = words.items[w]; *p; p++) {
-            char cs[2] = {*p, 0};
-            sa_push(&sym_seqs[w], cs);
-        }
-        sa_push(&sym_seqs[w], "</w>");
-    }
+    segarr_free(&segs);
 
     /* Allocate merge storage */
     if (tok->merges) free(tok->merges);
@@ -1245,8 +1313,8 @@ static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs,
     for (int iter = 0; iter < num_merges; iter++) {
         /* Count pairs */
         memset(pairs, 0, sizeof(PairEntry) * PAIR_CAP);
-        for (int w = 0; w < total_words; w++) {
-            StrArr *seq = &sym_seqs[w];
+        for (int s = 0; s < total_segs; s++) {
+            StrArr *seq = &sym_seqs[s];
             for (int i = 0; i < seq->len - 1; i++) {
                 unsigned int h = pair_hash(seq->items[i], seq->items[i+1]) % PAIR_CAP;
                 for (int probe = 0; probe < PAIR_CAP; probe++) {
@@ -1254,13 +1322,13 @@ static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs,
                     if (!pairs[idx].used) {
                         strncpy(pairs[idx].a, seq->items[i], 63);
                         strncpy(pairs[idx].b, seq->items[i+1], 63);
-                        pairs[idx].count = word_freq[w];
+                        pairs[idx].count = seg_freq[s];
                         pairs[idx].used = 1;
                         break;
                     }
                     if (strcmp(pairs[idx].a, seq->items[i]) == 0 &&
                         strcmp(pairs[idx].b, seq->items[i+1]) == 0) {
-                        pairs[idx].count += word_freq[w];
+                        pairs[idx].count += seg_freq[s];
                         break;
                     }
                 }
@@ -1282,16 +1350,17 @@ static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs,
         strncpy(best_a, pairs[best_idx].a, 63); best_a[63] = 0;
         strncpy(best_b, pairs[best_idx].b, 63); best_b[63] = 0;
 
+        /* Merged token uses "+" separator: "0x48+0x65" */
         char new_tok[128];
-        snprintf(new_tok, sizeof(new_tok), "%s%s", best_a, best_b);
+        snprintf(new_tok, sizeof(new_tok), "%s+%s", best_a, best_b);
 
         strncpy(tok->merges[tok->n_merges].a, best_a, 63);
         strncpy(tok->merges[tok->n_merges].b, best_b, 63);
         tok->n_merges++;
 
         /* Apply merge to all symbol sequences */
-        for (int w = 0; w < total_words; w++) {
-            StrArr *seq = &sym_seqs[w];
+        for (int s = 0; s < total_segs; s++) {
+            StrArr *seq = &sym_seqs[s];
             StrArr merged = {0};
             int i = 0;
             while (i < seq->len) {
@@ -1314,37 +1383,54 @@ static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs,
     }
 
     free(pairs);
-    for (int w = 0; w < total_words; w++) sa_free(&sym_seqs[w]);
+    for (int s = 0; s < total_segs; s++) sa_free(&sym_seqs[s]);
     free(sym_seqs);
-    free(word_freq);
-    sa_free(&words);
+    free(seg_freq);
 }
 
-/* Apply BPE merges to a word, returning symbol array */
-static StrArr tok_apply_bpe_to_word(EvolvingTokenizer *tok, const char *word) {
-    StrArr symbols = {0};
-    for (const char *p = word; *p; p++) {
-        char cs[2] = {*p, 0};
-        sa_push(&symbols, cs);
+/* Apply BPE merges to a token sequence (greedy, lowest-rank first).
+ * Input: StrArr of token names (e.g. "0x48", "0x65", ...).
+ * Returns: new StrArr with merges applied. Caller must sa_free. */
+static StrArr tok_apply_bpe(EvolvingTokenizer *tok, StrArr *input) {
+    if (!tok->n_merges || input->len < 2) {
+        StrArr copy = {0};
+        for (int i = 0; i < input->len; i++) sa_push(&copy, input->items[i]);
+        return copy;
     }
-    sa_push(&symbols, "</w>");
 
-    for (int m = 0; m < tok->n_merges; m++) {
-        const char *ma = tok->merges[m].a;
-        const char *mb = tok->merges[m].b;
+    StrArr symbols = {0};
+    for (int i = 0; i < input->len; i++) sa_push(&symbols, input->items[i]);
+
+    while (symbols.len >= 2) {
+        /* Find the pair with lowest merge rank */
+        int best_rank = tok->n_merges; /* sentinel: impossible rank */
+        int best_pos = -1;
+        for (int i = 0; i < symbols.len - 1; i++) {
+            /* Look up rank of this pair */
+            for (int m = 0; m < tok->n_merges; m++) {
+                if (m >= best_rank) break; /* can't improve */
+                if (strcmp(symbols.items[i], tok->merges[m].a) == 0 &&
+                    strcmp(symbols.items[i+1], tok->merges[m].b) == 0) {
+                    best_rank = m;
+                    best_pos = i;
+                    break;
+                }
+            }
+        }
+        if (best_pos < 0) break; /* no applicable merge */
+
+        /* Build merged token name with "+" separator */
         char new_tok[128];
-        snprintf(new_tok, sizeof(new_tok), "%s%s", ma, mb);
+        snprintf(new_tok, sizeof(new_tok), "%s+%s",
+                 tok->merges[best_rank].a, tok->merges[best_rank].b);
 
+        /* Replace the pair at best_pos */
         StrArr merged = {0};
         int i = 0;
-        int found = 0;
         while (i < symbols.len) {
-            if (i < symbols.len - 1 &&
-                strcmp(symbols.items[i], ma) == 0 &&
-                strcmp(symbols.items[i+1], mb) == 0) {
+            if (i == best_pos) {
                 sa_push(&merged, new_tok);
                 i += 2;
-                found = 1;
             } else {
                 sa_push(&merged, symbols.items[i]);
                 i++;
@@ -1352,7 +1438,6 @@ static StrArr tok_apply_bpe_to_word(EvolvingTokenizer *tok, const char *word) {
         }
         sa_free(&symbols);
         symbols = merged;
-        if (!found) continue; /* optimization: skip if merge not found */
     }
     return symbols;
 }
@@ -1386,74 +1471,93 @@ static IntArr tok_encode(EvolvingTokenizer *tok, const char *s) {
     IntArr ids = {0};
     /* Skip leading/trailing whitespace */
     while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    int slen = strlen(s);
+    int slen = (int)strlen(s);
     while (slen > 0 && (s[slen-1] == ' ' || s[slen-1] == '\t' || s[slen-1] == '\n')) slen--;
 
     ia_push(&ids, tok->bos_id);
 
-    if (!tok->bpe_enabled) {
-        /* Char-level encoding */
-        for (int i = 0; i < slen; i++) {
-            char cs[2] = {s[i], 0};
-            int id = stoi_get(tok->stoi, cs);
-            if (id >= 0) ia_push(&ids, id);
+    if (slen == 0) {
+        ia_push(&ids, tok->eos_id);
+        return ids;
+    }
+
+    /* Make a null-terminated copy of the trimmed string */
+    char *trimmed = malloc(slen + 1);
+    memcpy(trimmed, s, slen);
+    trimmed[slen] = 0;
+
+    /* Segment by Unicode category */
+    SegArr segs = unicode_segment(trimmed);
+    free(trimmed);
+
+    for (int si = 0; si < segs.len; si++) {
+        /* Convert segment bytes to base token names */
+        StrArr base_tokens = {0};
+        for (int b = 0; b < segs.segs[si].len; b++) {
+            char hex[8];
+            snprintf(hex, sizeof(hex), "0x%02x", segs.segs[si].data[b]);
+            sa_push(&base_tokens, hex);
         }
-    } else {
-        /* BPE encoding: split into words, apply merges per word */
-        const char *p = s;
-        const char *end = s + slen;
-        int first_word = 1;
-        while (p < end) {
-            /* Skip spaces */
-            while (p < end && *p == ' ') p++;
-            if (p >= end) break;
 
-            /* Insert space token between words */
-            if (!first_word) {
-                int sp_id = stoi_get(tok->stoi, " ");
-                if (sp_id >= 0) ia_push(&ids, sp_id);
-            }
-            first_word = 0;
-
-            /* Extract word */
-            const char *ws = p;
-            while (p < end && *p != ' ') p++;
-            int wlen = (int)(p - ws);
-            char *word = malloc(wlen + 1);
-            memcpy(word, ws, wlen); word[wlen] = 0;
-
-            /* Apply BPE */
-            StrArr syms = tok_apply_bpe_to_word(tok, word);
-            for (int i = 0; i < syms.len; i++) {
-                if (strcmp(syms.items[i], "</w>") == 0) continue;
-                int id = stoi_get(tok->stoi, syms.items[i]);
+        if (tok->bpe_enabled) {
+            /* Apply BPE merges */
+            StrArr merged = tok_apply_bpe(tok, &base_tokens);
+            for (int i = 0; i < merged.len; i++) {
+                int id = stoi_get(tok->stoi, merged.items[i]);
                 if (id >= 0) ia_push(&ids, id);
             }
-            sa_free(&syms);
-            free(word);
+            sa_free(&merged);
+        } else {
+            /* No BPE: each byte is its own token */
+            for (int i = 0; i < base_tokens.len; i++) {
+                int id = stoi_get(tok->stoi, base_tokens.items[i]);
+                if (id >= 0) ia_push(&ids, id);
+            }
         }
+        sa_free(&base_tokens);
     }
+    segarr_free(&segs);
 
     ia_push(&ids, tok->eos_id);
     return ids;
 }
 
+/* Convert a token string to raw bytes. Returns number of bytes written.
+ * Single byte token "0xNN" (no '+', len==4): one byte.
+ * Merged token "0x48+0x65+...": split by '+', each part → one byte. */
+static int tok_token_to_bytes(const char *tok_str, unsigned char *out, int out_cap) {
+    int pos = 0;
+    const char *p = tok_str;
+    while (*p && pos < out_cap) {
+        if (p[0] == '0' && p[1] == 'x' && p[2] && p[3]) {
+            char hex[3] = {p[2], p[3], 0};
+            out[pos++] = (unsigned char)strtol(hex, NULL, 16);
+            p += 4;
+            if (*p == '+') p++; /* skip separator */
+        } else {
+            break; /* unexpected format */
+        }
+    }
+    return pos;
+}
+
 static char *tok_decode(EvolvingTokenizer *tok, const int *ids, int n) {
     size_t bufcap = 1024;
-    char *buf = calloc(bufcap, 1);
+    unsigned char *buf = calloc(bufcap, 1);
     size_t pos = 0;
+    unsigned char tmp[256];
     for (int i = 0; i < n; i++) {
         if (ids[i] < 0 || ids[i] >= tok->vocab_size) continue;
         const char *t = tok->tokens[ids[i]];
         if (strcmp(t, "<BOS>") == 0 || strcmp(t, "<PAD>") == 0) continue;
         if (strcmp(t, "<EOS>") == 0) break;
-        size_t tlen = strlen(t);
-        while (pos + tlen + 1 > bufcap) { bufcap *= 2; buf = realloc(buf, bufcap); }
-        memcpy(buf + pos, t, tlen);
-        pos += tlen;
+        int nb = tok_token_to_bytes(t, tmp, sizeof(tmp));
+        while (pos + nb + 1 > bufcap) { bufcap *= 2; buf = realloc(buf, bufcap); }
+        memcpy(buf + pos, tmp, nb);
+        pos += nb;
     }
     buf[pos] = 0;
-    return buf;
+    return (char *)buf;
 }
 
 /* ============================================================

@@ -486,44 +486,66 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
 
 
 # ============================================================
-# 3) TOKENIZER — char first, then BPE that only EXPANDS vocab
+# 3) TOKENIZER — byte-level BPE (GPT-3/4 style)
 # ============================================================
+
+import unicodedata
+
+def _unicode_segment(text):
+    """Pre-segmentation by Unicode category. BPE merges happen WITHIN segments only.
+    Categories: letters (+marks), digits, whitespace, punctuation/symbols."""
+    segments = []
+    current = []
+    current_cat = None
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat[0] == 'L' or cat[0] == 'M':  # letter or combining mark
+            cat_group = 'L'
+        elif cat[0] == 'N':  # number/digit
+            cat_group = 'N'
+        elif cat[0] == 'Z' or ch in ('\n', '\r', '\t'):  # whitespace
+            cat_group = 'Z'
+        else:  # punctuation, symbols, everything else
+            cat_group = 'P'
+        if cat_group != current_cat and current:
+            segments.append(bytes(current))
+            current = []
+        current_cat = cat_group
+        current.extend(ch.encode('utf-8'))
+    if current:
+        segments.append(bytes(current))
+    return segments
+
 
 class EvolvingTokenizer:
     """
-    Starts as char-level.
-    Later learns BPE merges and ADDS new tokens, never removing old ones.
-    That means: existing weights remain valid; matrices only grow rows.
+    Byte-level BPE tokenizer (GPT-3/4 style).
+    Bootstrap: 256 byte tokens + BOS + EOS + PAD = 259 tokens.
+    BPE merges operate on byte sequences within Unicode segments.
+    Vocab only EXPANDS — existing weights remain valid.
     """
-    def __init__(self, docs):
-        # And lo, the alphabet shall be forged from the corpus.
-        base_text = "\n".join(docs) + "\n"
-        self.base_chars = sorted(set(base_text))
+    def __init__(self, docs=None):
         self.BOS = "<BOS>"
         self.EOS = "<EOS>"
         self.PAD = "<PAD>"
 
-        # vocab tokens are strings; chars are tokens too
-        self.tokens = list(self.base_chars) + [self.PAD, self.BOS, self.EOS]
+        # 256 byte tokens (hex strings like "0x00"..."0xff") + 3 special tokens
+        self.tokens = [f"0x{i:02x}" for i in range(256)] + [self.BOS, self.EOS, self.PAD]
         self.stoi = {t: i for i, t in enumerate(self.tokens)}
         self.itos = {i: t for t, i in self.stoi.items()}
-        self.vocab_size = len(self.tokens)
+        self.vocab_size = len(self.tokens)  # 259
 
         # BPE state
         self.bpe_enabled = False
-        self.merges = []        # list of pairs, in rank order
-        self.merge_to_tok = {}  # (a,b) -> new_token string
-        self._trained_chars = len(base_text)
+        self.merges = []        # list of (token_a, token_b) pairs, rank-ordered
+        self.merge_to_tok = {}  # (a,b) -> merged_token string
+        self._trained_chars = sum(len(d) for d in docs) if docs else 0
 
-    def _word_to_symbols(self, word):
-        # Classic BPE uses an end-of-word marker so spaces survive.
-        return list(word) + ["</w>"]
-
-    def _get_pairs(self, symbols):
-        return {(symbols[i], symbols[i+1]) for i in range(len(symbols) - 1)}
+    def _bytes_to_token_ids(self, raw_bytes):
+        """Convert raw bytes to base token IDs (0-255)."""
+        return list(raw_bytes)
 
     def maybe_enable_bpe(self, docs):
-        # And lo, when the corpus grows heavy enough, subwords shall awaken.
         total_chars = sum(len(x) for x in docs)
         if (not self.bpe_enabled) and total_chars >= CFG.enable_bpe_after_chars:
             self.train_bpe(docs, CFG.bpe_num_merges)
@@ -543,43 +565,43 @@ class EvolvingTokenizer:
         return False
 
     def train_bpe(self, docs, num_merges):
-        # And lo, the merges shall be learned from raw sentences, because we have no excuses.
+        """Learn BPE merges from corpus. Operates on byte sequences within Unicode segments."""
         text = " ".join(docs)
-        words = [w for w in text.split() if w]
-        if not words:
+        if not text:
             return
 
+        # Segment and convert to byte-token sequences
+        segments = _unicode_segment(text)
+        # Count frequency of each byte-token sequence
         vocab = Counter()
-        for w in words:
-            vocab[tuple(self._word_to_symbols(w))] += 1
-
-        merges = []
-        merge_to_tok = {}
+        for seg in segments:
+            tok_seq = tuple(self.tokens[b] for b in seg)  # e.g. ("0x48", "0x65", "0x6c")
+            vocab[tok_seq] += 1
 
         for _ in range(num_merges):
             pairs = defaultdict(int)
-            for sym_seq, freq in vocab.items():
-                for i in range(len(sym_seq) - 1):
-                    pairs[(sym_seq[i], sym_seq[i+1])] += freq
+            for tok_seq, freq in vocab.items():
+                for i in range(len(tok_seq) - 1):
+                    pairs[(tok_seq[i], tok_seq[i+1])] += freq
             if not pairs:
                 break
             best = max(pairs, key=pairs.get)
             a, b = best
-            new_tok = a + b
-            merges.append(best)
-            merge_to_tok[best] = new_tok
+            new_tok = a + "+" + b  # e.g. "0x48+0x65"
+            self.merges.append(best)
+            self.merge_to_tok[best] = new_tok
 
-            # merge in vocab
+            # Merge in vocab
             new_vocab = Counter()
-            for sym_seq, freq in vocab.items():
+            for tok_seq, freq in vocab.items():
                 out = []
                 i = 0
-                while i < len(sym_seq):
-                    if i < len(sym_seq) - 1 and (sym_seq[i], sym_seq[i+1]) == best:
+                while i < len(tok_seq):
+                    if i < len(tok_seq) - 1 and (tok_seq[i], tok_seq[i+1]) == best:
                         out.append(new_tok)
                         i += 2
                     else:
-                        out.append(sym_seq[i])
+                        out.append(tok_seq[i])
                         i += 1
                 new_vocab[tuple(out)] += freq
             vocab = new_vocab
@@ -589,73 +611,82 @@ class EvolvingTokenizer:
                 self.stoi[new_tok] = len(self.tokens)
                 self.tokens.append(new_tok)
 
-        # ensure special tokens exist (they do)
         self.itos = {i: t for t, i in self.stoi.items()}
         self.vocab_size = len(self.tokens)
-        self.merges = merges
-        self.merge_to_tok = merge_to_tok
 
-    def _apply_bpe_to_word(self, word):
-        # And lo, greedy merging by learned rank shall be performed.
-        symbols = self._word_to_symbols(word)
+    def _apply_bpe(self, token_seq):
+        """Apply learned BPE merges to a sequence of tokens (greedy, lowest-rank first)."""
+        if not self.merges:
+            return token_seq
 
-        # Build ranks (lower is better)
+        symbols = list(token_seq)
         rank = {pair: i for i, pair in enumerate(self.merges)}
 
-        while True:
+        while len(symbols) >= 2:
             pairs = [(rank.get((symbols[i], symbols[i+1]), 10**9), i)
                      for i in range(len(symbols) - 1)]
-            if not pairs:
-                break
             best_rank, idx = min(pairs, key=lambda x: x[0])
             if best_rank == 10**9:
                 break
             pair = (symbols[idx], symbols[idx+1])
-            new_tok = self.merge_to_tok[pair]
-            symbols = symbols[:idx] + [new_tok] + symbols[idx+2:]
+            symbols = symbols[:idx] + [self.merge_to_tok[pair]] + symbols[idx+2:]
         return symbols
 
     def encode(self, s: str):
+        """Encode text to token IDs: text → segments → bytes → BPE → IDs."""
         s = s.strip()
         ids = [self.stoi[self.BOS]]
 
-        if not self.bpe_enabled:
-            for ch in s:
-                if ch in self.stoi:
-                    ids.append(self.stoi[ch])
+        if not s:
             ids.append(self.stoi[self.EOS])
             return ids
 
-        # BPE mode (still safe: chars remain valid tokens)
-        words = s.split()
-        for wi, w in enumerate(words):
-            syms = self._apply_bpe_to_word(w)
-            for tok in syms:
-                if tok == "</w>":
-                    continue
+        segments = _unicode_segment(s)
+        for seg in segments:
+            # Convert bytes to base token names
+            base_tokens = tuple(self.tokens[b] for b in seg)
+            if self.bpe_enabled:
+                merged = self._apply_bpe(base_tokens)
+            else:
+                merged = base_tokens
+            for tok in merged:
                 if tok in self.stoi:
                     ids.append(self.stoi[tok])
-            if wi != len(words) - 1:
-                # represent spaces as the actual space char if present; fallback to '\n' or nothing
-                if " " in self.stoi:
-                    ids.append(self.stoi[" "])
+
         ids.append(self.stoi[self.EOS])
         return ids
 
+    def _token_to_bytes(self, tok):
+        """Convert a token string back to bytes."""
+        if tok.startswith("0x") and "+" not in tok and len(tok) == 4:
+            # Single byte token: "0x41" → bytes([0x41])
+            return bytes([int(tok, 16)])
+        elif "+" in tok:
+            # Merged token: "0x48+0x65" → recurse
+            parts = tok.split("+")
+            result = b""
+            # Rebuild from parts — each part is either "0xNN" or a sub-merge
+            i = 0
+            while i < len(parts):
+                result += bytes([int(parts[i], 16)])
+                i += 1
+            return result
+        return b""
+
     def decode(self, ids):
-        out = []
+        """Decode token IDs back to text: IDs → bytes → UTF-8."""
+        raw_bytes = b""
         for t in ids:
             tok = self.itos.get(t, "")
             if tok in (self.BOS, self.PAD):
                 continue
             if tok == self.EOS:
                 break
-            # BPE tokens are just strings; join them
-            out.append(tok)
-        s = "".join(out)
-        # cleanup the accidental end markers if any slipped (shouldn't)
-        s = s.replace("</w>", "")
-        return " ".join(s.split()).strip()
+            raw_bytes += self._token_to_bytes(tok)
+        try:
+            return raw_bytes.decode('utf-8', errors='replace').strip()
+        except Exception:
+            return raw_bytes.decode('utf-8', errors='replace').strip()
 
 # ============================================================
 # 4) AUTOGRAD — vectors, not scalar confetti
@@ -1792,7 +1823,7 @@ def load_checkpoint(docs, path=None):
 
     merges = t.get("merges", [])
     tok.merges = [tuple(p) for p in merges if isinstance(p, list) and len(p) == 2]
-    tok.merge_to_tok = {tuple(p): (p[0] + p[1]) for p in tok.merges}
+    tok.merge_to_tok = {tuple(p): (p[0] + "+" + p[1]) for p in tok.merges}
     tok.bpe_enabled = bool(t.get("bpe_enabled", False))
     tok._trained_chars = int(t.get("trained_chars", 0))
 

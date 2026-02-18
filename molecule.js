@@ -10,7 +10,7 @@
  * - Trains on nonames.txt (fetched or pasted)
  * - Keeps IndexedDB memory (because localStorage has a 5MB soul)
  * - Maintains a bounded corpus reservoir (never bloats)
- * - Starts in char-level mode (fast boot)
+ * - Starts in byte-level mode (256 byte tokens + specials)
  * - Gradually enables BPE without invalidating old weights (vocab only EXPANDS)
  * - Never forgets by never overwriting learned deltas: it only appends modules
  *
@@ -538,38 +538,58 @@ function corpusGenerate(tok, field, seedText, maxTokens) {
 
 class EvolvingTokenizer {
     constructor(docs) {
-        const baseText = docs.join("\n") + "\n";
-        this.baseChars = Array.from(new Set(baseText.split(""))).sort();
+        if (docs === undefined) docs = [];
         this.BOS = "<BOS>";
         this.EOS = "<EOS>";
         this.PAD = "<PAD>";
 
-        this.tokens = this.baseChars.concat([this.PAD, this.BOS, this.EOS]);
+        // 256 byte tokens (hex strings "0x00" through "0xff") + 3 special tokens = 259
+        this.tokens = [];
+        for (let i = 0; i < 256; i++) {
+            this.tokens.push("0x" + i.toString(16).padStart(2, "0"));
+        }
+        this.tokens.push(this.BOS, this.EOS, this.PAD);
+
         this.stoi = new Map();
         this.itos = new Map();
         for (let i = 0; i < this.tokens.length; i++) {
             this.stoi.set(this.tokens[i], i);
             this.itos.set(i, this.tokens[i]);
         }
-        this.vocabSize = this.tokens.length;
+        this.vocabSize = this.tokens.length; // 259
 
         // BPE state
         this.bpeEnabled = false;
         this.merges = [];
         this.mergeToTok = new Map();
-        this._trainedChars = baseText.length;
+        this._trainedChars = docs.reduce((s, d) => s + d.length, 0);
+
+        // Reusable TextEncoder/TextDecoder
+        this._encoder = new TextEncoder();
+        this._decoder = new TextDecoder("utf-8", { fatal: false });
     }
 
-    _wordToSymbols(word) {
-        return word.split("").concat(["</w>"]);
-    }
-
-    _getPairs(symbols) {
-        const pairs = new Set();
-        for (let i = 0; i < symbols.length - 1; i++) {
-            pairs.add(symbols[i] + "\x00" + symbols[i + 1]);
+    _unicodeSegment(text) {
+        // Pre-segmentation by Unicode category. BPE merges happen WITHIN segments only.
+        // Categories: letters (+marks), digits, whitespace, punctuation/symbols.
+        const segments = [];
+        let current = [];
+        let currentCat = null;
+        for (const ch of text) {
+            let cat;
+            if (/\p{L}|\p{M}/u.test(ch)) cat = "L";
+            else if (/\p{N}/u.test(ch)) cat = "N";
+            else if (/\s/.test(ch)) cat = "Z";
+            else cat = "P";
+            if (cat !== currentCat && current.length > 0) {
+                segments.push(this._encoder.encode(current.join("")));
+                current = [];
+            }
+            currentCat = cat;
+            current.push(ch);
         }
-        return pairs;
+        if (current.length > 0) segments.push(this._encoder.encode(current.join("")));
+        return segments;
     }
 
     maybeEnableBpe(docs) {
@@ -596,15 +616,19 @@ class EvolvingTokenizer {
     }
 
     trainBpe(docs, numMerges) {
-        // And lo, the merges shall be learned from raw sentences.
+        // And lo, the merges shall be learned from byte sequences within Unicode segments.
         const text = docs.join(" ");
-        const words = text.split(/\s+/).filter(w => w.length > 0);
-        if (words.length === 0) return;
+        if (!text) return;
 
-        // Build initial vocab of symbol sequences with frequencies
+        // Segment and convert to byte-token sequences, count frequencies
+        const segments = this._unicodeSegment(text);
         let vocab = new Map();
-        for (const w of words) {
-            const key = this._wordToSymbols(w).join("\x00");
+        for (const seg of segments) {
+            const tokSeq = [];
+            for (let i = 0; i < seg.length; i++) {
+                tokSeq.push(this.tokens[seg[i]]); // e.g. "0x48", "0x65", "0x6c"
+            }
+            const key = tokSeq.join("\x00");
             vocab.set(key, (vocab.get(key) || 0) + 1);
         }
 
@@ -629,7 +653,7 @@ class EvolvingTokenizer {
                 if (count > bestCount) { bestCount = count; bestPair = pk; }
             }
             const [a, b] = bestPair.split("\x00");
-            const newTok = a + b;
+            const newTok = a + "+" + b; // e.g. "0x48+0x65"
             merges.push([a, b]);
             mergeToTok.set(bestPair, newTok);
 
@@ -669,69 +693,85 @@ class EvolvingTokenizer {
         this.mergeToTok = mergeToTok;
     }
 
-    _applyBpeToWord(word) {
+    _applyBPE(tokens) {
         // And lo, greedy merging by learned rank shall be performed.
-        let symbols = this._wordToSymbols(word);
+        if (this.merges.length === 0) return tokens;
         const rank = new Map();
         for (let i = 0; i < this.merges.length; i++) {
             rank.set(this.merges[i][0] + "\x00" + this.merges[i][1], i);
         }
 
-        while (true) {
-            let bestRank = 1e9, bestIdx = -1;
+        let symbols = tokens.slice();
+        while (symbols.length >= 2) {
+            let bestRank = Infinity, bestIdx = -1;
             for (let i = 0; i < symbols.length - 1; i++) {
-                const pk = symbols[i] + "\x00" + symbols[i + 1];
-                const r = rank.has(pk) ? rank.get(pk) : 1e9;
-                if (r < bestRank) { bestRank = r; bestIdx = i; }
+                const key = symbols[i] + "\x00" + symbols[i + 1];
+                const r = rank.get(key);
+                if (r !== undefined && r < bestRank) { bestRank = r; bestIdx = i; }
             }
-            if (bestRank === 1e9) break;
-            const pair = symbols[bestIdx] + "\x00" + symbols[bestIdx + 1];
-            const newTok = this.mergeToTok.get(pair);
-            symbols = symbols.slice(0, bestIdx).concat([newTok], symbols.slice(bestIdx + 2));
+            if (bestIdx === -1) break;
+            const pairKey = symbols[bestIdx] + "\x00" + symbols[bestIdx + 1];
+            const merged = this.mergeToTok.get(pairKey) || (symbols[bestIdx] + "+" + symbols[bestIdx + 1]);
+            symbols = symbols.slice(0, bestIdx).concat([merged], symbols.slice(bestIdx + 2));
         }
         return symbols;
     }
 
     encode(s) {
+        // Encode text to token IDs: text -> segments -> bytes -> BPE -> IDs
         s = s.trim();
         const ids = [this.stoi.get(this.BOS)];
 
-        if (!this.bpeEnabled) {
-            for (const ch of s) {
-                if (this.stoi.has(ch)) ids.push(this.stoi.get(ch));
-            }
+        if (!s) {
             ids.push(this.stoi.get(this.EOS));
             return ids;
         }
 
-        // BPE mode
-        const words = s.split(/\s+/);
-        for (let wi = 0; wi < words.length; wi++) {
-            if (!words[wi]) continue;
-            const syms = this._applyBpeToWord(words[wi]);
-            for (const tok of syms) {
-                if (tok === "</w>") continue;
+        const segments = this._unicodeSegment(s);
+        for (const seg of segments) {
+            // Convert bytes to base token names
+            const baseTokens = [];
+            for (let i = 0; i < seg.length; i++) {
+                baseTokens.push(this.tokens[seg[i]]);
+            }
+            const merged = this.bpeEnabled ? this._applyBPE(baseTokens) : baseTokens;
+            for (const tok of merged) {
                 if (this.stoi.has(tok)) ids.push(this.stoi.get(tok));
             }
-            if (wi !== words.length - 1 && this.stoi.has(" ")) {
-                ids.push(this.stoi.get(" "));
-            }
         }
+
         ids.push(this.stoi.get(this.EOS));
         return ids;
     }
 
+    _tokenToBytes(tok) {
+        // Convert a token string back to bytes.
+        if (tok.startsWith("0x") && tok.indexOf("+") === -1 && tok.length === 4) {
+            // Single byte token: "0x41" -> [0x41]
+            return [parseInt(tok, 16)];
+        } else if (tok.indexOf("+") !== -1) {
+            // Merged token: "0x48+0x65" -> split by "+", each "0xNN" -> byte
+            const parts = tok.split("+");
+            const result = [];
+            for (let i = 0; i < parts.length; i++) {
+                result.push(parseInt(parts[i], 16));
+            }
+            return result;
+        }
+        return [];
+    }
+
     decode(ids) {
-        const out = [];
+        // Decode token IDs back to text: IDs -> bytes -> UTF-8
+        const rawBytes = [];
         for (const t of ids) {
             const tok = this.itos.get(t) || "";
             if (tok === this.BOS || tok === this.PAD) continue;
             if (tok === this.EOS) break;
-            out.push(tok);
+            const bytes = this._tokenToBytes(tok);
+            for (let i = 0; i < bytes.length; i++) rawBytes.push(bytes[i]);
         }
-        let s = out.join("");
-        s = s.replace(/<\/w>/g, "");
-        return s.split(/\s+/).join(" ").trim();
+        return this._decoder.decode(new Uint8Array(rawBytes)).trim();
     }
 }
 
@@ -2104,7 +2144,7 @@ async function loadCheckpoint(docs) {
     }
     tok.merges = (t.merges || []).filter(p => Array.isArray(p) && p.length === 2);
     tok.mergeToTok = new Map();
-    for (const [a, b] of tok.merges) tok.mergeToTok.set(a + "\x00" + b, a + b);
+    for (const [a, b] of tok.merges) tok.mergeToTok.set(a + "\x00" + b, a + "+" + b);
     tok.bpeEnabled = !!t.bpeEnabled;
     tok._trainedChars = t.trainedChars || 0;
 
