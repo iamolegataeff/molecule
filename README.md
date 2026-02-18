@@ -9,7 +9,7 @@
 
 # molecule | by Arianna Method
 
-> *A dependency-free, async, continually-learning GPT organism with hybrid attention and native personality.*
+> *A single-file, async, continually-learning GPT organism with hybrid attention and native personality.*
 >
 ---
 
@@ -18,7 +18,7 @@
 ```
 THIS IS:
 - Three implementations: Python, Go, C — same architecture
-- Zero dependencies in Python 
+- One dependency in Python (numpy) — zero in Go and C
 - Custom autograd engine (vectors, not scalar confetti)
 - RoPE position encoding (GPT-3/4 inspired)
 - SwiGLU-like gated MLP (LLaMA vibes)
@@ -58,9 +58,8 @@ So I built it. **molecule.** Thanks to Karpathy's microgpt, but this is not a fo
 ## Quick Start
 
 ```bash
-# You need: Python 3.7+
-# You need: literally nothing else
-
+# You need: Python 3.7+ and numpy
+pip install numpy
 python molecule.py
 ```
 
@@ -328,7 +327,7 @@ Formally, this implements a self-referential quality gate: `f: S → D → {acce
 | Noise rejection | None | **Native immune system** (γ drift + delta rollback) |
 | Sampling | top-k | **min_p + typical_p + nucleus** |
 | Weight tying | No | **Yes (GPT-style)** |
-| Dependencies | torch | **None** |
+| Dependencies | torch | **numpy** (Python) / **none** (Go, C) |
 
 ---
 
@@ -394,7 +393,7 @@ The same architecture, three languages:
 
 | Version | File | Language | Dependencies | Notes |
 |---------|------|----------|--------------|-------|
-| **molecule.py** | `molecule.py` | Python 3.7+ | None | The original. Pure Python, zero deps. **v2 with all features.** |
+| **molecule.py** | `molecule.py` | Python 3.7+ | numpy | The original. numpy-accelerated autograd. **v2 with all features.** |
 | **molecule.go** | `molecule.go` | Go 1.21+ | `modernc.org/sqlite` | Pure Go, no CGO. Goroutines for async training. |
 | **molecule.c** | `molecule.c` | C99 | `sqlite3`, `pthreads` | Arena allocator, pthreads, binary checkpoints. |
 
@@ -421,7 +420,7 @@ All three share the same core architecture: vector autograd, RoPE, SwiGLU, delta
 python -m pytest tests/ -v
 ```
 
-**77 tests** covering:
+**82 tests** covering:
 - Autograd (forward + backward, VectorValue + ScalarValue)
 - Tokenizer (char-level + BPE + vocab growth)
 - Model (GPT, MatrixParam, DeltaAdapter, RoPE)
@@ -438,7 +437,7 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Learns continuously
 - Never forgets
 - Grows organically
-- Has no dependencies
+- Has one dependency (numpy) — Go and C have zero
 - Fits in one file
 - Speaks before it learns
 - Grows a personality from zero
@@ -456,7 +455,7 @@ Because atoms are micrograd. We build molecules.
 
 ## Known Limitations
 
-1. **It's slow.** Pure Python. No CUDA. No vectorized numpy. It's a philosophical statement, not a production system.
+1. **It's Python.** numpy-accelerated but no CUDA. Go and C versions are fast natively. Use those for production.
 
 2. **It's small.** 2 layers, 72 dims, 4 heads (2 content + 2 hybrid). You're not getting GPT-4 reasoning. You're getting an embryo that *could* grow.
 
@@ -494,6 +493,6 @@ GNU GPLv3 — Because freedom matters.
 
 - [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language
 
-- **molecule** — Dependency-Free Continual GPT
+- **molecule** — Single-File Continual GPT
 
 *Patterns over parameters. Emergence over engineering. The organism continues.*
