@@ -97,6 +97,14 @@ typedef struct {
     double syntropy_lr_boost;         /* boost LR when syntropy is rising */
     double syntropy_lr_dampen;        /* dampen LR when syntropy is falling */
     double syntropy_delta_grow_boost; /* higher delta grow prob when syntropy is good */
+
+    /* Phase 1: cosine LR schedule */
+    double lr_min;
+    int max_total_steps;
+    int cosine_warmup_steps;
+
+    /* Phase 1: gradient accumulation */
+    int accum_steps;
 } Config;
 
 static Config CFG = {
@@ -129,7 +137,7 @@ static Config CFG = {
     .max_gen_tokens = 180,
     .min_gen_tokens = 16,
     .repetition_guard = 4,
-    .enable_bpe_after_chars = 25000,
+    .enable_bpe_after_chars = 20000,
     .bpe_num_merges = 384,
     .bpe_retrain_every_chars = 4000,
     .train_tick_seconds = 0.25,
@@ -151,6 +159,10 @@ static Config CFG = {
     .syntropy_lr_boost = 1.3,
     .syntropy_lr_dampen = 0.6,
     .syntropy_delta_grow_boost = 0.15,
+    .lr_min = 0.001,
+    .max_total_steps = 50000,
+    .cosine_warmup_steps = 200,
+    .accum_steps = 1,
 };
 
 /* ============================================================
@@ -399,6 +411,35 @@ static Node *vec_relu(Node *a) {
         c->a = a; c->len = n;
         out->ctx = c;
         out->backward = back_relu;
+        Node *kids[] = {a};
+        node_set_children(out, kids, 1);
+    }
+    return out;
+}
+
+/* SiLU (Swish): silu(x) = x * sigmoid(x) — real SwiGLU activation */
+static void back_silu(Node *self) {
+    BinCtx *c = self->ctx;
+    for (int i = 0; i < c->len; i++) {
+        double x = c->a->data[i];
+        double sig = 1.0 / (1.0 + exp(-x));
+        c->a->grad[i] += (sig + x * sig * (1.0 - sig)) * self->grad[i];
+    }
+}
+
+static Node *vec_silu(Node *a) {
+    int n = a->len;
+    Node *out = node_new(n);
+    for (int i = 0; i < n; i++) {
+        double x = a->data[i];
+        double sig = 1.0 / (1.0 + exp(-x));
+        out->data[i] = x * sig;
+    }
+    if (grad_enabled) {
+        BinCtx *c = arena_alloc(&G_arena, sizeof(BinCtx));
+        c->a = a; c->len = n;
+        out->ctx = c;
+        out->backward = back_silu;
         Node *kids[] = {a};
         node_set_children(out, kids, 1);
     }
@@ -1535,6 +1576,10 @@ typedef struct {
     double **init_embed_snapshot; /* [vocab_size][n_embd] */
     int init_embed_rows;
 
+    /* Phase 1: residual scaling + global step counter */
+    double residual_alpha;
+    int global_step;
+
     pthread_mutex_t mu;
 } GPT;
 
@@ -1599,6 +1644,8 @@ static GPT *gpt_new(EvolvingTokenizer *tok) {
     g->n_head = CFG.n_head;
     g->head_dim = CFG.n_embd / CFG.n_head;
     g->block_size = CFG.block_size;
+    g->residual_alpha = 1.0 / sqrt((double)CFG.n_layer);
+    g->global_step = 0;
     pthread_mutex_init(&g->mu, NULL);
 
     int V = tok->vocab_size;
@@ -1814,18 +1861,20 @@ static Node *gpt_forward_step(GPT *g, int token_id, int pos_id, KVCache *kv) {
         Node *x_attn = vec_concat(head_outs, g->n_head);
         snprintf(name, sizeof(name), "l%d.wo", li);
         x = gpt_apply(g, name, x_attn);
+        x = vec_scale(x, g->residual_alpha);
         x = vec_add(x, x_res);
 
-        /* Gated MLP (SwiGLU-ish) */
+        /* Gated MLP (real SwiGLU) */
         x_res = x;
         x = rmsnorm(x);
         snprintf(name, sizeof(name), "l%d.fc_g", li);
-        Node *gate = vec_relu(gpt_apply(g, name, x));
+        Node *gate = vec_silu(gpt_apply(g, name, x));
         snprintf(name, sizeof(name), "l%d.fc_v", li);
         Node *val = gpt_apply(g, name, x);
         x = vec_mul(gate, val);
         snprintf(name, sizeof(name), "l%d.fc2", li);
         x = gpt_apply(g, name, x);
+        x = vec_scale(x, g->residual_alpha);
         x = vec_add(x, x_res);
     }
 
@@ -2820,6 +2869,17 @@ static void syntropy_log_to_db(SyntropyTracker *st, sqlite3 *db,
 /* ============================================================
  * 9) TRAINING
  * ============================================================ */
+
+static double cosine_lr(int global_step) {
+    if (global_step < CFG.cosine_warmup_steps) {
+        /* Linear warmup from lr_min to learning_rate */
+        double t = (double)global_step / (double)(CFG.cosine_warmup_steps > 0 ? CFG.cosine_warmup_steps : 1);
+        return CFG.lr_min + t * (CFG.learning_rate - CFG.lr_min);
+    }
+    double progress = (double)global_step / (double)(CFG.max_total_steps > 0 ? CFG.max_total_steps : 1);
+    if (progress > 1.0) progress = 1.0;
+    return CFG.lr_min + 0.5 * (CFG.learning_rate - CFG.lr_min) * (1.0 + cos(M_PI * progress));
+}
 
 static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
                         int train_base, int train_deltas) {

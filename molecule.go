@@ -60,6 +60,14 @@ type Config struct {
 	FreezeBaseAfterWarm bool    `json:"freeze_base_after_warmup"`
 	BatchSize           int     `json:"batch_size"`
 
+	// cosine LR schedule
+	LRMin              float64 `json:"lr_min"`
+	MaxTotalSteps      int     `json:"max_total_steps"`
+	CosineWarmupSteps  int     `json:"cosine_warmup_steps"`
+
+	// gradient accumulation
+	AccumSteps int `json:"accum_steps"`
+
 	// deltas
 	DeltaRank      int     `json:"delta_rank"`
 	MaxDeltaModules int    `json:"max_delta_modules"`
@@ -138,6 +146,10 @@ var CFG = Config{
 	GradClip:             1.0,
 	FreezeBaseAfterWarm:  true,
 	BatchSize:            4,
+	LRMin:                0.001,
+	MaxTotalSteps:        50000,
+	CosineWarmupSteps:    200,
+	AccumSteps:           1,
 	DeltaRank:            8,
 	MaxDeltaModules:      12,
 	DeltaGrowProb:        0.08,
@@ -149,7 +161,7 @@ var CFG = Config{
 	MaxGenTokens:         180,
 	MinGenTokens:         16,
 	RepetitionGuard:      4,
-	EnableBPEAfterChars:  25000,
+	EnableBPEAfterChars:  20000,
 	BPENumMerges:         384,
 	BPERetrainEveryChars: 4000,
 	TrainTickSeconds:     0.25,
@@ -347,6 +359,29 @@ func (v *Vec) ReLU() *Vec {
 				if vData[i] > 0 {
 					v.Grad[i] += out.Grad[i]
 				}
+			}
+		}
+	}
+	return out
+}
+
+// SiLU applies silu(x) = x * sigmoid(x) element-wise (for real SwiGLU).
+func (v *Vec) SiLU() *Vec {
+	n := len(v.Data)
+	sig := make([]float64, n)
+	d := make([]float64, n)
+	for i := 0; i < n; i++ {
+		sig[i] = 1.0 / (1.0 + math.Exp(-v.Data[i]))
+		d[i] = v.Data[i] * sig[i]
+	}
+	out := NewVec(d)
+	if gradEnabled {
+		out.children = []Node{v}
+		vData := v.Data
+		out.backFn = func() {
+			for i := 0; i < n; i++ {
+				// d/dx[x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+				v.Grad[i] += (sig[i] * (1.0 + vData[i]*(1.0-sig[i]))) * out.Grad[i]
 			}
 		}
 	}
@@ -1337,6 +1372,9 @@ type GPT struct {
 
 	InitEmbedSnapshot [][]float64 // snapshot of initial embeddings for gamma
 
+	residualAlpha float64 // 1/sqrt(nLayer) scaling for residual connections
+	globalStep    int     // global training step counter (for cosine LR + checkpoint)
+
 	mu sync.Mutex // protects model during concurrent access
 }
 
@@ -1357,6 +1395,8 @@ func NewGPT(tok *EvolvingTokenizer) *GPT {
 		Base:      make(map[string]*MatrixParam),
 		Adam:      make(map[string]*AdamState),
 	}
+
+	gpt.residualAlpha = 1.0 / math.Sqrt(math.Max(1, float64(CFG.NLayer)))
 
 	V := tok.VocabSize
 	gpt.Base["wte"] = NewMatrixParam(V, CFG.NEmbd, 0.08)
@@ -2080,19 +2120,19 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 		}
 
 		xAttn := Concat(headOutputs)
-		x = gpt.applyWithDeltas(pfx+"wo", xAttn)
-		x = x.Add(xRes)
+		attnOut := gpt.applyWithDeltas(pfx+"wo", xAttn)
+		x = xRes.Add(attnOut.Scale(gpt.residualAlpha))
 
 		// ---- Gated MLP (SwiGLU-ish) ----
 		xRes = x
 		x = RMSNorm(x)
 
-		g := gpt.applyWithDeltas(pfx+"fc_g", x).ReLU() // gate
+		g := gpt.applyWithDeltas(pfx+"fc_g", x).SiLU() // gate (SwiGLU)
 		u := gpt.applyWithDeltas(pfx+"fc_v", x)         // value
-		x = g.MulVec(u)                                  // gating
+		mlpX := g.MulVec(u)                              // gating
 
-		x = gpt.applyWithDeltas(pfx+"fc2", x)
-		x = x.Add(xRes)
+		mlpOut := gpt.applyWithDeltas(pfx+"fc2", mlpX)
+		x = xRes.Add(mlpOut.Scale(gpt.residualAlpha))
 	}
 
 	x = RMSNorm(x)
@@ -2611,6 +2651,7 @@ type CheckpointData struct {
 	Alpha             []float64              `json:"alpha"`
 	Deltas            []map[string]DeltaJSON `json:"deltas"`
 	InitEmbedSnapshot [][]float64            `json:"init_embed_snapshot,omitempty"`
+	GlobalStep        int                    `json:"global_step"`
 }
 
 type TokenizerJSON struct {
@@ -2692,6 +2733,7 @@ func SaveCheckpoint(model *GPT, tok *EvolvingTokenizer, path string) error {
 		Alpha:             model.ActiveAlpha,
 		Deltas:            deltas,
 		InitEmbedSnapshot: model.InitEmbedSnapshot,
+		GlobalStep:        model.globalStep,
 	}
 
 	f, err := os.Create(path)
@@ -2781,6 +2823,9 @@ func LoadCheckpoint(docs []string, path string) (*GPT, *EvolvingTokenizer, error
 			model.InitEmbedSnapshot[i] = snap
 		}
 	}
+
+	// Restore global step
+	model.globalStep = ckpt.GlobalStep
 
 	// Ensure hybrid attention weights exist (backward compat with old checkpoints)
 	for li := 0; li < CFG.NLayer; li++ {
@@ -3274,6 +3319,17 @@ func (st *SyntropyTracker) LogToDB(db *sql.DB, entropyBefore, entropyAfter float
 		action, nil)
 }
 
+// cosineLR returns learning rate for the given global step using cosine schedule with linear warmup.
+func cosineLR(globalStep int) float64 {
+	if globalStep < CFG.CosineWarmupSteps {
+		// Linear warmup from LRMin to LearningRate
+		t := float64(globalStep) / math.Max(1, float64(CFG.CosineWarmupSteps))
+		return CFG.LRMin + (CFG.LearningRate-CFG.LRMin)*t
+	}
+	progress := math.Min(1.0, float64(globalStep)/math.Max(1, float64(CFG.MaxTotalSteps)))
+	return CFG.LRMin + 0.5*(CFG.LearningRate-CFG.LRMin)*(1.0+math.Cos(math.Pi*progress))
+}
+
 func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, trainBase, trainDeltas bool) {
 	if len(docs) == 0 {
 		return
@@ -3291,23 +3347,38 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 		deltaParams = model.AllDeltaParams()
 	}
 
+	accum := CFG.AccumSteps
+	if accum < 1 {
+		accum = 1
+	}
+
 	for step := 0; step < steps; step++ {
-		// Sample batch
-		batch := make([]string, CFG.BatchSize)
-		for i := range batch {
-			batch[i] = docs[rand.Intn(len(docs))]
-		}
-		var batchIDs [][]int
-		for _, doc := range batch {
-			if doc != "" {
-				batchIDs = append(batchIDs, tok.Encode(doc))
+		// Gradient accumulation: accumulate over accum micro-batches, then step
+		var lastLossVal float64
+		for micro := 0; micro < accum; micro++ {
+			batch := make([]string, CFG.BatchSize)
+			for i := range batch {
+				batch[i] = docs[rand.Intn(len(docs))]
 			}
+			var batchIDs [][]int
+			for _, doc := range batch {
+				if doc != "" {
+					batchIDs = append(batchIDs, tok.Encode(doc))
+				}
+			}
+
+			loss := model.LossOnBatch(batchIDs)
+			// Scale loss for accumulation
+			if accum > 1 {
+				loss = loss.MulF(1.0 / float64(accum))
+			}
+			Backward(loss)
+			lastLossVal = loss.Data * float64(accum) // unscaled for display
 		}
 
-		loss := model.LossOnBatch(batchIDs)
-		Backward(loss)
+		lr := cosineLR(model.globalStep)
+		model.globalStep++
 
-		lr := CFG.LearningRate * (1.0 - float64(step)/math.Max(1, float64(steps)))
 		if len(baseParams) > 0 {
 			model.AdamStep(baseParams, "base", lr)
 		}
@@ -3316,7 +3387,7 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 		}
 
 		if step%100 == 0 {
-			fmt.Printf("  train step %d/%d | loss %.4f\n", step, steps, loss.Data)
+			fmt.Printf("  train step %d/%d | loss %.4f | lr %.5f\n", step, steps, lastLossVal, lr)
 		}
 	}
 }

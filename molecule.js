@@ -71,7 +71,7 @@ const CFG = {
     repetitionGuard: 4,
 
     // tokenizer evolution
-    enableBpeAfterChars: 25000,
+    enableBpeAfterChars: 20000,
     bpeNumMerges: 384,
     bpeRetrainEveryChars: 4000,
 
@@ -105,6 +105,14 @@ const CFG = {
     syntropyLrBoost: 1.3,
     syntropyLrDampen: 0.6,
     syntropyDeltaGrowBoost: 0.2,
+
+    // cosine LR schedule
+    lrMin: 0.001,
+    maxTotalSteps: 50000,
+    cosineWarmupSteps: 200,
+
+    // gradient accumulation
+    accumSteps: 1,
 
     // quantum buffer
     qbCooldownSeconds: 10.0,
@@ -868,6 +876,32 @@ class VectorValue {
         return result;
     }
 
+    silu() {
+        // SiLU (Sigmoid Linear Unit): x * sigmoid(x)
+        // The real activation for SwiGLU, not the relu impostor.
+        const n = this.data.length;
+        const out = new Float64Array(n);
+        const sig = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+            sig[i] = 1.0 / (1.0 + Math.exp(-this.data[i]));
+            out[i] = this.data[i] * sig[i];
+        }
+        const result = new VectorValue(out);
+        if (_gradEnabled) {
+            result._children = [this];
+            const xSnap = new Float64Array(this.data);
+            const sigSnap = new Float64Array(sig);
+            result._backFn = () => {
+                // d_silu/dx = sig * (1 + x * (1 - sig))
+                for (let i = 0; i < n; i++) {
+                    const dsilu = sigSnap[i] * (1.0 + xSnap[i] * (1.0 - sigSnap[i]));
+                    this.grad[i] += dsilu * result.grad[i];
+                }
+            };
+        }
+        return result;
+    }
+
     dot(other) {
         // And lo, two vectors shall touch tips and produce a scalar. Mathematics is romantic.
         let val = 0;
@@ -1411,6 +1445,10 @@ class GPT {
             }
         }
 
+        // Residual scaling: deeper networks need gentler residual branches
+        this.residualAlpha = 1.0 / Math.sqrt(Math.max(1, this.nLayer));
+        this.globalStep = 0;
+
         // Modular deltas
         this.deltas = [];
         this.activeAlpha = [];
@@ -1858,16 +1896,16 @@ class GPT {
 
             const xAttn = VectorValue.concat(headOutputs);
             x = this._applyWithDeltas(`l${li}.wo`, xAttn);
-            x = x.add(xRes);
+            x = xRes.add(x.mul(this.residualAlpha));
 
-            // ---- Gated MLP (SwiGLU-ish) ----
+            // ---- Gated MLP (SwiGLU) ----
             const xRes2 = x;
             x = rmsnorm(x);
-            const g = this._applyWithDeltas(`l${li}.fc_g`, x).relu();
+            const g = this._applyWithDeltas(`l${li}.fc_g`, x).silu();
             const u = this._applyWithDeltas(`l${li}.fc_v`, x);
             x = g.mul(u);
             x = this._applyWithDeltas(`l${li}.fc2`, x);
-            x = x.add(xRes2);
+            x = xRes2.add(x.mul(this.residualAlpha));
         }
 
         x = rmsnorm(x);
@@ -2009,6 +2047,7 @@ async function saveCheckpoint(model, tok) {
         },
         base: {},
         alpha: model.activeAlpha,
+        globalStep: model.globalStep,
         initEmbedSnapshot: model._initEmbedSnapshot.map(a => Array.from(a)),
         deltas: [],
     };
@@ -2052,6 +2091,9 @@ async function loadCheckpoint(docs) {
     tok._trainedChars = t.trainedChars || 0;
 
     const model = new GPT(tok);
+
+    // Restore globalStep for cosine LR continuity
+    model.globalStep = obj.globalStep || 0;
 
     // Restore base
     model.base = {};
@@ -2107,23 +2149,43 @@ async function loadCheckpoint(docs) {
 // 9) TRAINING — warmup, then continual micro-bursts
 // ============================================================
 
+function cosineLR(globalStep) {
+    const lrMax = CFG.learningRate;
+    const lrMin = CFG.lrMin;
+    if (globalStep < CFG.cosineWarmupSteps) {
+        // Linear warmup
+        return lrMin + (lrMax - lrMin) * (globalStep / Math.max(1, CFG.cosineWarmupSteps));
+    }
+    const progress = (globalStep - CFG.cosineWarmupSteps) /
+        Math.max(1, CFG.maxTotalSteps - CFG.cosineWarmupSteps);
+    return lrMin + 0.5 * (lrMax - lrMin) * (1 + Math.cos(Math.PI * Math.min(progress, 1.0)));
+}
+
 function trainSteps(model, tok, docs, steps, trainBase, trainDeltas) {
     if (!docs.length) return;
     const baseParams = trainBase ? model.allBaseParams() : [];
     const deltaParams = trainDeltas ? model.allDeltaParams() : [];
 
     for (let step = 0; step < steps; step++) {
-        const batch = randomChoices(docs, CFG.batchSize);
-        const batchIds = batch.filter(d => d).map(d => tok.encode(d));
+        // --- Gradient accumulation loop ---
+        let accumLoss = null;
+        for (let acc = 0; acc < CFG.accumSteps; acc++) {
+            const batch = randomChoices(docs, CFG.batchSize);
+            const batchIds = batch.filter(d => d).map(d => tok.encode(d));
 
-        const loss = model.lossOnBatch(batchIds);
-        backward(loss);
+            const loss = model.lossOnBatch(batchIds).mul(1.0 / CFG.accumSteps);
+            backward(loss);
 
-        const lr = CFG.learningRate * (1.0 - step / Math.max(1, steps));
+            if (accumLoss === null) accumLoss = loss.data;
+            else accumLoss += loss.data;
+        }
+
+        const lr = cosineLR(model.globalStep);
         if (baseParams.length) model.adamStep(baseParams, "base", lr);
         if (deltaParams.length) model.adamStep(deltaParams, "delta", lr);
+        model.globalStep++;
 
-        if (step % 100 === 0) logUI(`  train step ${step}/${steps} | loss ${loss.data.toFixed(4)}`);
+        if (step % 100 === 0) logUI(`  train step ${step}/${steps} | loss ${(accumLoss || 0).toFixed(4)} | lr ${lr.toFixed(6)}`);
     }
 }
 

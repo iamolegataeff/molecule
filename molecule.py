@@ -66,6 +66,10 @@ class Config:
     grad_clip: float = 1.0    # And lo, the gradients shall not explode into the sun.
     freeze_base_after_warmup: bool = True
     batch_size: int = 4
+    accum_steps: int = 1     # gradient accumulation (effective batch = batch_size * accum_steps)
+    lr_min: float = 0.001
+    max_total_steps: int = 50000
+    cosine_warmup_steps: int = 200
 
     # deltas (LoRA-ish)
     delta_rank: int = 8
@@ -83,7 +87,7 @@ class Config:
     repetition_guard: int = 4
 
     # tokenizer evolution
-    enable_bpe_after_chars: int = 25000  # corpus size threshold to begin learning merges
+    enable_bpe_after_chars: int = 20000  # corpus size threshold to begin learning merges
     bpe_num_merges: int = 384
     bpe_retrain_every_chars: int = 4000  # retrain merges when corpus changes enough
 
@@ -754,6 +758,18 @@ class VectorValue:
             out._back_fn = _back
         return out
 
+    def silu(self):
+        sig = 1.0 / (1.0 + np.exp(-self.data))
+        out = VectorValue(self.data * sig)
+        if _GRAD_ENABLED:
+            out._children = (self,)
+            def _back():
+                # d/dx[x * sigmoid(x)] = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+                #                       = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+                self.grad += (sig * (1.0 + self.data * (1.0 - sig))) * out.grad
+            out._back_fn = _back
+        return out
+
     def squared_relu(self):
         r = np.maximum(0.0, self.data)
         out = VectorValue(r * r)
@@ -1167,6 +1183,8 @@ class GPT:
         self.head_dim = CFG.n_embd // CFG.n_head
         self.block_size = CFG.block_size
         self.lock = threading.Lock()
+        self.residual_alpha = 1.0 / math.sqrt(max(1, CFG.n_layer))
+        self.global_step = 0
 
         # Base weights
         V = tok.vocab_size
@@ -1580,19 +1598,19 @@ class GPT:
                 head_outputs.append(head_out)
 
             x_attn = VectorValue.concat(head_outputs)
-            x = self._apply_with_deltas(f"l{li}.wo", x_attn)
-            x = x + x_res
+            attn_out = self._apply_with_deltas(f"l{li}.wo", x_attn)
+            x = x_res + attn_out * self.residual_alpha
 
             # ---- Gated MLP (SwiGLU-ish) ----
             x_res = x
             x = rmsnorm(x)
 
-            g = self._apply_with_deltas(f"l{li}.fc_g", x).relu()   # gate
+            g = self._apply_with_deltas(f"l{li}.fc_g", x).silu()   # gate (SwiGLU)
             u = self._apply_with_deltas(f"l{li}.fc_v", x)          # value
             x = g * u                                              # gating
 
-            x = self._apply_with_deltas(f"l{li}.fc2", x)
-            x = x + x_res
+            mlp_out = self._apply_with_deltas(f"l{li}.fc2", x)
+            x = x_res + mlp_out * self.residual_alpha
 
         x = rmsnorm(x)
         logits = self._apply_with_deltas("lm_head", x)
@@ -1726,6 +1744,7 @@ def save_checkpoint(model: GPT, tok: EvolvingTokenizer, path=None):
         "base": {k: _serialize_matrix_param(v) for k, v in model.base.items()},
         "alpha": model.active_alpha,
         "init_embed_snapshot": model._init_embed_snapshot,
+        "global_step": model.global_step,
         "deltas": []
     }
     for mod in model.deltas:
@@ -1799,6 +1818,8 @@ def load_checkpoint(docs, path=None):
         model._init_embed_snapshot = snapshot
     else:
         model._init_embed_snapshot = [row.data.tolist() for row in model.base["wte"].rows]
+
+    model.global_step = obj.get("global_step", 0)
 
     return model, tok
 
@@ -1915,6 +1936,14 @@ class SyntropyTracker:
         con.commit()
 
 
+def cosine_lr(global_step):
+    """Global cosine LR with linear warmup."""
+    if global_step < CFG.cosine_warmup_steps:
+        return CFG.lr_min + (CFG.learning_rate - CFG.lr_min) * (global_step / max(1, CFG.cosine_warmup_steps))
+    progress = min(1.0, global_step / max(1, CFG.max_total_steps))
+    return CFG.lr_min + 0.5 * (CFG.learning_rate - CFG.lr_min) * (1.0 + math.cos(math.pi * progress))
+
+
 def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True, train_deltas=True):
     if not docs:
         return
@@ -1925,23 +1954,28 @@ def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True
 def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
     base_params = model.all_base_params() if train_base else []
     delta_params = model.all_delta_params() if train_deltas else []
+    accum = CFG.accum_steps
 
     for step in range(steps):
-        # And lo, the training batch shall be sampled from the cursed book of names.
-        batch = random.choices(docs, k=CFG.batch_size)
-        batch_ids = [tok.encode(doc) for doc in batch if doc]
+        # Gradient accumulation: accumulate over accum micro-batches, then step
+        for micro in range(accum):
+            batch = random.choices(docs, k=CFG.batch_size)
+            batch_ids = [tok.encode(doc) for doc in batch if doc]
 
-        loss = model.loss_on_batch(batch_ids)
-        backward(loss)
+            loss = model.loss_on_batch(batch_ids)
+            loss = loss * (1.0 / accum)  # scale loss for accumulation
+            backward(loss)
 
-        lr = CFG.learning_rate * (1.0 - (step / max(1, steps)))
+        lr = cosine_lr(model.global_step)
+        model.global_step += 1
+
         if base_params:
             model.adam_step(base_params, key="base", lr=lr)
         if delta_params:
             model.adam_step(delta_params, key="delta", lr=lr)
 
         if step % 100 == 0:
-            print(f"  train step {step}/{steps} | loss {loss.data:.4f}")
+            print(f"  train step {step}/{steps} | loss {loss.data * accum:.4f} | lr {lr:.5f}")
 
 # And lo, the buffer shall measure not just bytes but novelty, for raw mass means nothing without surprise.
 class QuantumBuffer:
