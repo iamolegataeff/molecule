@@ -246,7 +246,9 @@ typedef struct { int *items; int len, cap; } IntArr;
 static void sa_push(StrArr *a, const char *s) {
     if (a->len >= a->cap) {
         a->cap = a->cap ? a->cap * 2 : 16;
-        a->items = realloc(a->items, sizeof(char*) * a->cap);
+        void *tmp = realloc(a->items, sizeof(char*) * a->cap);
+        if (!tmp) { fprintf(stderr, "[sa_push] realloc failed\n"); return; }
+        a->items = tmp;
     }
     a->items[a->len++] = strdup(s);
 }
@@ -260,7 +262,9 @@ static void sa_free(StrArr *a) {
 static void ia_push(IntArr *a, int v) {
     if (a->len >= a->cap) {
         a->cap = a->cap ? a->cap * 2 : 16;
-        a->items = realloc(a->items, sizeof(int) * a->cap);
+        void *tmp = realloc(a->items, sizeof(int) * a->cap);
+        if (!tmp) { fprintf(stderr, "[ia_push] realloc failed\n"); return; }
+        a->items = tmp;
     }
     a->items[a->len++] = v;
 }
@@ -788,8 +792,16 @@ static MatrixParam *mat_new(int nout, int nin, double std) {
 
 static void mat_grow_rows(MatrixParam *m, int new_nout, double std) {
     if (new_nout <= m->nout) return;
-    m->row_data = realloc(m->row_data, sizeof(double*) * new_nout);
-    m->row_grad = realloc(m->row_grad, sizeof(double*) * new_nout);
+    void *tmp_data = realloc(m->row_data, sizeof(double*) * new_nout);
+    void *tmp_grad = realloc(m->row_grad, sizeof(double*) * new_nout);
+    if (!tmp_data || !tmp_grad) {
+        fprintf(stderr, "[mat_grow_rows] realloc failed\n");
+        if (tmp_data) m->row_data = tmp_data;
+        if (tmp_grad) m->row_grad = tmp_grad;
+        return;
+    }
+    m->row_data = tmp_data;
+    m->row_grad = tmp_grad;
     for (int i = m->nout; i < new_nout; i++) {
         m->row_data[i] = calloc(m->nin, sizeof(double));
         m->row_grad[i] = calloc(m->nin, sizeof(double));
@@ -803,8 +815,16 @@ static void mat_grow_rows(MatrixParam *m, int new_nout, double std) {
 static void mat_grow_cols(MatrixParam *m, int new_nin, double std) {
     if (new_nin <= m->nin) return;
     for (int i = 0; i < m->nout; i++) {
-        m->row_data[i] = realloc(m->row_data[i], sizeof(double) * new_nin);
-        m->row_grad[i] = realloc(m->row_grad[i], sizeof(double) * new_nin);
+        void *tmp_d = realloc(m->row_data[i], sizeof(double) * new_nin);
+        void *tmp_g = realloc(m->row_grad[i], sizeof(double) * new_nin);
+        if (!tmp_d || !tmp_g) {
+            fprintf(stderr, "[mat_grow_cols] realloc failed at row %d\n", i);
+            if (tmp_d) m->row_data[i] = tmp_d;
+            if (tmp_g) m->row_grad[i] = tmp_g;
+            return;
+        }
+        m->row_data[i] = tmp_d;
+        m->row_grad[i] = tmp_g;
         for (int j = m->nin; j < new_nin; j++) {
             m->row_data[i][j] = rand_normal() * std;
             m->row_grad[i][j] = 0.0;
@@ -1253,7 +1273,9 @@ static void tok_add_token(EvolvingTokenizer *tok, const char *s) {
     if (stoi_get(tok->stoi, s) >= 0) return;
     if (tok->vocab_size >= tok->cap) {
         tok->cap *= 2;
-        tok->tokens = realloc(tok->tokens, sizeof(char*) * tok->cap);
+        void *tmp = realloc(tok->tokens, sizeof(char*) * tok->cap);
+        if (!tmp) { fprintf(stderr, "[tok_add_token] realloc failed\n"); return; }
+        tok->tokens = tmp;
     }
     tok->tokens[tok->vocab_size] = strdup(s);
     stoi_put(tok->stoi, s, tok->vocab_size);
@@ -1269,7 +1291,9 @@ typedef struct { ByteSeg *segs; int len, cap; } SegArr;
 static void segarr_push(SegArr *a, unsigned char *data, int len) {
     if (a->len >= a->cap) {
         a->cap = a->cap ? a->cap * 2 : 32;
-        a->segs = realloc(a->segs, sizeof(ByteSeg) * a->cap);
+        void *tmp = realloc(a->segs, sizeof(ByteSeg) * a->cap);
+        if (!tmp) { fprintf(stderr, "[segarr_push] realloc failed\n"); return; }
+        a->segs = tmp;
     }
     a->segs[a->len].data = malloc(len);
     memcpy(a->segs[a->len].data, data, len);
@@ -1627,7 +1651,12 @@ static char *tok_decode(EvolvingTokenizer *tok, const int *ids, int n) {
         if (strcmp(t, "<BOS>") == 0 || strcmp(t, "<PAD>") == 0) continue;
         if (strcmp(t, "<EOS>") == 0) break;
         int nb = tok_token_to_bytes(t, tmp, sizeof(tmp));
-        while (pos + nb + 1 > bufcap) { bufcap *= 2; buf = realloc(buf, bufcap); }
+        while (pos + nb + 1 > bufcap) {
+            bufcap *= 2;
+            void *tmp2 = realloc(buf, bufcap);
+            if (!tmp2) { fprintf(stderr, "[tok_decode] realloc failed\n"); buf[pos] = 0; return (char *)buf; }
+            buf = tmp2;
+        }
         memcpy(buf + pos, tmp, nb);
         pos += nb;
     }
@@ -1690,6 +1719,10 @@ static DeltaAdapter *dmod_get(DeltaModule *m, const char *name) {
 }
 
 static void dmod_set(DeltaModule *m, const char *name, DeltaAdapter *da) {
+    if (m->count >= MAX_ADAPTERS_PER_MOD) {
+        fprintf(stderr, "[dmod_set] ERROR: exceeded MAX_ADAPTERS_PER_MOD (%d)\n", MAX_ADAPTERS_PER_MOD);
+        return;
+    }
     m->names[m->count] = strdup(name);
     m->adapters[m->count] = da;
     m->count++;
@@ -1743,8 +1776,21 @@ typedef struct {
     int n_trigrams, trigram_cap;
     BigramEntry *bigrams;
     int n_bigrams, bigram_cap;
+    /* Hash indices for O(1) lookup */
+    int *bigram_head;   /* [COOCCUR_HASH_SIZE] -> first index in bigrams[], or -1 */
+    int *bigram_next;   /* [bigram_cap] -> next index with same hash, or -1 */
+    int *trigram_head;  /* [COOCCUR_HASH_SIZE] -> first index in trigrams[], or -1 */
+    int *trigram_next;  /* [trigram_cap] -> next index with same hash, or -1 */
     int built;
 } CooccurField;
+
+/* Hash functions for cooccur lookup (needed before gpt_generate) */
+static inline unsigned int cooccur_bigram_hash(int prev) {
+    return ((unsigned int)prev * 2654435761u) & (COOCCUR_HASH_SIZE - 1);
+}
+static inline unsigned int cooccur_trigram_hash(int a, int b) {
+    return (((unsigned int)a * 2654435761u) ^ ((unsigned int)b * 2246822519u)) & (COOCCUR_HASH_SIZE - 1);
+}
 
 /* The GPT model */
 #define MAX_BASE_MATS 256  /* adult: 6 layers × ~20 matrices + embedding matrices */
@@ -2408,7 +2454,9 @@ static char *gpt_generate(GPT *g, const char *prompt) {
     int cur = ids.items[ids.len - 1];
     IntArr out_ids = {0};
     IntArr recent = {0};
-    double *probs_buf = malloc(sizeof(double) * g->tok->vocab_size);
+    int max_vocab = g->tok->vocab_size;
+    double *probs_buf = malloc(sizeof(double) * max_vocab);
+    double *scaled = malloc(sizeof(double) * max_vocab);
 
     for (int step = 0; step < CFG.max_gen_tokens; step++) {
         arena_reset(&G_arena);
@@ -2420,7 +2468,6 @@ static char *gpt_generate(GPT *g, const char *prompt) {
         double base_temp = CFG.temperature + g->syntropy_temp_offset;
         if (base_temp < 1e-6) base_temp = 1e-6;
         int V = logits->len;
-        double *scaled = malloc(sizeof(double) * V);
         for (int i = 0; i < V; i++) scaled[i] = logits->data[i] / base_temp;
         softmax_probs(scaled, V, probs_buf);
         double entropy = 0;
@@ -2440,10 +2487,11 @@ static char *gpt_generate(GPT *g, const char *prompt) {
                 double *corpus_probs = calloc(V, sizeof(double));
                 double total_c = 0;
                 int found = 0;
-                /* Try trigram first */
-                if (ids.len >= 2) {
+                /* Try trigram first (hash lookup) */
+                if (ids.len >= 2 && g->corpus_field->trigram_head) {
                     int a = ids.items[ids.len - 2], b = ids.items[ids.len - 1];
-                    for (int ti = 0; ti < g->corpus_field->n_trigrams; ti++) {
+                    unsigned int h = cooccur_trigram_hash(a, b);
+                    for (int ti = g->corpus_field->trigram_head[h]; ti >= 0; ti = g->corpus_field->trigram_next[ti]) {
                         if (g->corpus_field->trigrams[ti].key[0] == a &&
                             g->corpus_field->trigrams[ti].key[1] == b) {
                             int tid = g->corpus_field->trigrams[ti].key[2];
@@ -2455,10 +2503,11 @@ static char *gpt_generate(GPT *g, const char *prompt) {
                         }
                     }
                 }
-                /* Fallback to bigram */
-                if (!found && ids.len >= 1) {
+                /* Fallback to bigram (hash lookup) */
+                if (!found && ids.len >= 1 && g->corpus_field->bigram_head) {
                     int prev = ids.items[ids.len - 1];
-                    for (int bi = 0; bi < g->corpus_field->n_bigrams; bi++) {
+                    unsigned int h = cooccur_bigram_hash(prev);
+                    for (int bi = g->corpus_field->bigram_head[h]; bi >= 0; bi = g->corpus_field->bigram_next[bi]) {
                         if (g->corpus_field->bigrams[bi].key[0] == prev) {
                             int tid = g->corpus_field->bigrams[bi].key[1];
                             if (tid < V) {
@@ -2485,7 +2534,6 @@ static char *gpt_generate(GPT *g, const char *prompt) {
         }
 
         int nxt = top_k_top_p_sample(probs_buf, V, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p);
-        free(scaled);
 
         if (nxt == g->tok->eos_id) {
             if (step >= CFG.min_gen_tokens) break;
@@ -2544,6 +2592,7 @@ static char *gpt_generate(GPT *g, const char *prompt) {
 
     /* Cleanup */
     free(probs_buf);
+    free(scaled);
     ia_free(&ids); ia_free(&out_ids); ia_free(&recent); ia_free(&dec);
     for (int i = 0; i < kv->n_layers; i++) { free(kv->layers[i].keys); free(kv->layers[i].values); }
     free(kv->layers); free(kv);
@@ -2560,6 +2609,8 @@ static char *gpt_generate(GPT *g, const char *prompt) {
 static sqlite3 *init_db(const char *path) {
     sqlite3 *db;
     sqlite3_open(path, &db);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS messages("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                      "ts REAL NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL)", NULL, NULL, NULL);
@@ -2893,6 +2944,14 @@ static CooccurField *cooccur_new(int vocab_size) {
     cf->trigrams = calloc(cf->trigram_cap, sizeof(TrigramEntry));
     cf->bigram_cap = 8192;
     cf->bigrams = calloc(cf->bigram_cap, sizeof(BigramEntry));
+    /* Hash index arrays */
+    cf->bigram_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
+    cf->trigram_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
+    cf->bigram_next = malloc(sizeof(int) * cf->bigram_cap);
+    cf->trigram_next = malloc(sizeof(int) * cf->trigram_cap);
+    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) { cf->bigram_head[i] = -1; cf->trigram_head[i] = -1; }
+    for (int i = 0; i < cf->bigram_cap; i++) cf->bigram_next[i] = -1;
+    for (int i = 0; i < cf->trigram_cap; i++) cf->trigram_next[i] = -1;
     return cf;
 }
 
@@ -2923,6 +2982,20 @@ static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs
         }
         ia_free(&ids);
     }
+    /* Build hash indices for O(1) lookup */
+    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) { cf->bigram_head[i] = -1; cf->trigram_head[i] = -1; }
+    for (int i = 0; i < cf->n_bigrams; i++) cf->bigram_next[i] = -1;
+    for (int i = 0; i < cf->n_trigrams; i++) cf->trigram_next[i] = -1;
+    for (int i = 0; i < cf->n_bigrams; i++) {
+        unsigned int h = cooccur_bigram_hash(cf->bigrams[i].key[0]);
+        cf->bigram_next[i] = cf->bigram_head[h];
+        cf->bigram_head[h] = i;
+    }
+    for (int i = 0; i < cf->n_trigrams; i++) {
+        unsigned int h = cooccur_trigram_hash(cf->trigrams[i].key[0], cf->trigrams[i].key[1]);
+        cf->trigram_next[i] = cf->trigram_head[h];
+        cf->trigram_head[h] = i;
+    }
     cf->built = 1;
 }
 
@@ -2930,10 +3003,11 @@ static int cooccur_sample_next(CooccurField *cf, const int *ctx, int ctx_len, do
     double *counts = calloc(cf->vocab_size, sizeof(double));
     int found = 0;
 
-    /* Try trigram */
-    if (ctx_len >= 2) {
+    /* Try trigram (hash lookup) */
+    if (ctx_len >= 2 && cf->trigram_head) {
         int a = ctx[ctx_len-2], b = ctx[ctx_len-1];
-        for (int i = 0; i < cf->n_trigrams; i++) {
+        unsigned int h = cooccur_trigram_hash(a, b);
+        for (int i = cf->trigram_head[h]; i >= 0; i = cf->trigram_next[i]) {
             if (cf->trigrams[i].key[0] == a && cf->trigrams[i].key[1] == b) {
                 int c = cf->trigrams[i].key[2];
                 if (c < cf->vocab_size) { counts[c] += 1.0; found = 1; }
@@ -3686,19 +3760,23 @@ static void save_checkpoint(GPT *g, EvolvingTokenizer *tok, const char *path) {
 static char *build_prompt(sqlite3 *db, const char *user_text) {
     int n_msgs;
     Msg *msgs = db_recent(db, 14, &n_msgs);
-    char *buf = calloc(8192, 1);
-    strcat(buf, "A: (I listen. I answer. I learn.)\n");
+    size_t bufcap = 16384;
+    char *buf = calloc(bufcap, 1);
+    if (!buf) { free(msgs); return NULL; }
+    size_t pos = 0;
+
+    int written = snprintf(buf + pos, bufcap - pos, "A: (I listen. I answer. I learn.)\n");
+    if (written > 0 && (size_t)written < bufcap - pos) pos += written;
 
     int start = n_msgs > 12 ? n_msgs - 12 : 0;
     for (int i = start; i < n_msgs; i++) {
         const char *tag = strcmp(msgs[i].role, "user") == 0 ? "H:" : "A:";
-        char line[600];
-        snprintf(line, sizeof(line), "%s %.260s\n", tag, msgs[i].text);
-        strcat(buf, line);
+        written = snprintf(buf + pos, bufcap - pos, "%s %.260s\n", tag, msgs[i].text);
+        if (written > 0 && (size_t)written < bufcap - pos) pos += written;
+        else break;  /* buffer full */
     }
-    char line[600];
-    snprintf(line, sizeof(line), "H: %.260s\nA:", user_text);
-    strcat(buf, line);
+    written = snprintf(buf + pos, bufcap - pos, "H: %.260s\nA:", user_text);
+    if (written > 0 && (size_t)written < bufcap - pos) pos += written;
 
     free(msgs);
     return buf;
@@ -3825,7 +3903,9 @@ static SwarmPeer *swarm_discover_peers(SwarmRegistry *sw, int *out_count, double
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         if (count >= cap) {
             cap = cap ? cap * 2 : 8;
-            peers = realloc(peers, sizeof(SwarmPeer) * cap);
+            void *tmp = realloc(peers, sizeof(SwarmPeer) * cap);
+            if (!tmp) { fprintf(stderr, "[swarm_discover] realloc failed\n"); break; }
+            peers = tmp;
         }
         strncpy(peers[count].id, (const char *)sqlite3_column_text(stmt, 0), 63);
         peers[count].id[63] = 0;

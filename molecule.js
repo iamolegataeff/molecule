@@ -204,8 +204,10 @@ class MoleculeDB {
             const req = indexedDB.open("molecule_memory", 3);
             req.onupgradeneeded = (e) => {
                 const db = e.target.result;
-                if (!db.objectStoreNames.contains("messages"))
-                    db.createObjectStore("messages", { keyPath: "id", autoIncrement: true });
+                if (!db.objectStoreNames.contains("messages")) {
+                    const store = db.createObjectStore("messages", { keyPath: "id", autoIncrement: true });
+                    store.createIndex("ts", "ts");
+                }
                 if (!db.objectStoreNames.contains("corpus_events"))
                     db.createObjectStore("corpus_events", { keyPath: "id", autoIncrement: true });
                 if (!db.objectStoreNames.contains("growth"))
@@ -493,9 +495,12 @@ class CooccurField {
                     bm.set(tid, (bm.get(tid) || 0) + 1);
                 }
                 if (i >= 2) {
-                    const tkey = ids[i - 2] + "," + ids[i - 1];
-                    if (!this.trigram.has(tkey)) this.trigram.set(tkey, new Map());
-                    const tm = this.trigram.get(tkey);
+                    const key1 = ids[i - 2];
+                    if (!this.trigram.has(key1)) this.trigram.set(key1, new Map());
+                    const m2 = this.trigram.get(key1);
+                    const key2 = ids[i - 1];
+                    if (!m2.has(key2)) m2.set(key2, new Map());
+                    const tm = m2.get(key2);
                     tm.set(tid, (tm.get(tid) || 0) + 1);
                 }
             }
@@ -508,9 +513,12 @@ class CooccurField {
         let dist = null;
 
         if (contextIds.length >= 2) {
-            const tkey = contextIds[contextIds.length - 2] + "," + contextIds[contextIds.length - 1];
-            if (this.trigram.has(tkey) && this.trigram.get(tkey).size > 0) {
-                dist = this.trigram.get(tkey);
+            const k1 = contextIds[contextIds.length - 2];
+            const k2 = contextIds[contextIds.length - 1];
+            const m2 = this.trigram.get(k1);
+            if (m2) {
+                const tm = m2.get(k2);
+                if (tm && tm.size > 0) dist = tm;
             }
         }
         if (dist === null && contextIds.length >= 1) {
@@ -898,12 +906,10 @@ class VectorValue {
             const result = new VectorValue(out);
             if (_gradEnabled) {
                 result._children = [this, other];
-                const sd = new Float64Array(this.data);
-                const od = new Float64Array(other.data);
                 result._backFn = () => {
                     for (let i = 0; i < n; i++) {
-                        this.grad[i] += od[i] * result.grad[i];
-                        other.grad[i] += sd[i] * result.grad[i];
+                        this.grad[i] += other.data[i] * result.grad[i];
+                        other.grad[i] += this.data[i] * result.grad[i];
                     }
                 };
             }
@@ -1135,6 +1141,11 @@ function backward(root) {
     root.grad = 1.0;
     for (let i = topo.length - 1; i >= 0; i--) {
         if (topo[i]._backFn) topo[i]._backFn();
+    }
+    // Cleanup: release the computation graph to avoid memory leaks
+    for (const v of topo) {
+        v._children = [];
+        v._backFn = null;
     }
 }
 
@@ -1942,15 +1953,19 @@ class GPT {
                     const ctx = ids.slice(Math.max(0, pos - 1), pos + 1);
                     let filled = false;
                     if (ctx.length >= 2) {
-                        const tkey = ctx[ctx.length - 2] + "," + ctx[ctx.length - 1];
-                        if (field.trigram.has(tkey)) {
-                            const tri = field.trigram.get(tkey);
-                            let total = 0;
-                            for (const c of tri.values()) total += c;
-                            for (const [tid, cnt] of tri) {
-                                if (tid < fieldProbs.length) fieldProbs[tid] = cnt / total;
+                        const tk1 = ctx[ctx.length - 2];
+                        const tk2 = ctx[ctx.length - 1];
+                        const m2 = field.trigram.get(tk1);
+                        if (m2) {
+                            const tri = m2.get(tk2);
+                            if (tri) {
+                                let total = 0;
+                                for (const c of tri.values()) total += c;
+                                for (const [tid, cnt] of tri) {
+                                    if (tid < fieldProbs.length) fieldProbs[tid] = cnt / total;
+                                }
+                                filled = true;
                             }
-                            filled = true;
                         }
                     }
                     if (!filled && ctx.length >= 1) {
@@ -2251,6 +2266,7 @@ class GPT {
         const outIds = [];
         const recent = [];
         const eosId = this.tok.stoi.get(this.tok.EOS);
+        let scaled = null; // pre-allocated across steps
         const bosId = this.tok.stoi.get(this.tok.BOS);
 
         for (let step = 0; step < CFG.maxGenTokens; step++) {
@@ -2260,19 +2276,20 @@ class GPT {
             // entropy-adaptive temperature (with syntropy offset)
             let baseTemp = CFG.temperature + this.syntropyTempOffset;
             if (baseTemp <= 1e-6) baseTemp = 1e-6;
-            const rawScaled = new Array(logits.data.length);
-            for (let i = 0; i < logits.data.length; i++) rawScaled[i] = logits.data[i] / baseTemp;
-            const probs0 = softmaxProbsFloat(rawScaled);
+            const vocabLen = logits.data.length;
+            if (!scaled || scaled.length !== vocabLen) scaled = new Array(vocabLen);
+            for (let i = 0; i < vocabLen; i++) scaled[i] = logits.data[i] / baseTemp;
+            let probs = softmaxProbsFloat(scaled);
             let entropy = 0;
-            for (const p of probs0) if (p > 1e-12) entropy -= p * Math.log(p);
+            for (const p of probs) if (p > 1e-12) entropy -= p * Math.log(p);
             let tMul = 1.0;
             if (entropy < CFG.entropyLow) tMul = CFG.entropyTempBoost;
             else if (entropy > CFG.entropyHigh) tMul = CFG.entropyTempFocus;
-            const temp = baseTemp * tMul;
-
-            const scaled = new Array(logits.data.length);
-            for (let i = 0; i < logits.data.length; i++) scaled[i] = logits.data[i] / temp;
-            let probs = softmaxProbsFloat(scaled);
+            if (tMul !== 1.0) {
+                const temp = baseTemp * tMul;
+                for (let i = 0; i < vocabLen; i++) scaled[i] = logits.data[i] / temp;
+                probs = softmaxProbsFloat(scaled);
+            }
 
             // Adaptive corpus blend: corpus field fades as model becomes coherent
             if (this._corpusField && this._corpusField.bigram.size > 0) {
@@ -2281,9 +2298,12 @@ class GPT {
                     let corpusDist = null;
                     // Try trigram first
                     if (ids.length >= 2) {
-                        const tkey = ids[ids.length - 2] + "," + ids[ids.length - 1];
-                        if (this._corpusField.trigram.has(tkey)) {
-                            corpusDist = this._corpusField.trigram.get(tkey);
+                        const tk1 = ids[ids.length - 2];
+                        const tk2 = ids[ids.length - 1];
+                        const m2 = this._corpusField.trigram.get(tk1);
+                        if (m2) {
+                            const tm = m2.get(tk2);
+                            if (tm) corpusDist = tm;
                         }
                     }
                     // Fallback to bigram
@@ -3150,6 +3170,7 @@ let _logEl = null;
 let _chatEl = null;
 let _statusEl = null;
 
+let _scrollPending = false;
 function logUI(msg) {
     console.log(msg);
     if (_logEl) {
@@ -3157,7 +3178,16 @@ function logUI(msg) {
         line.className = "mol-log-line";
         line.textContent = msg;
         _logEl.appendChild(line);
-        _logEl.scrollTop = _logEl.scrollHeight;
+        while (_logEl.children.length > 200) {
+            _logEl.removeChild(_logEl.children[0]);
+        }
+        if (!_scrollPending) {
+            _scrollPending = true;
+            requestAnimationFrame(() => {
+                _logEl.scrollTop = _logEl.scrollHeight;
+                _scrollPending = false;
+            });
+        }
     }
 }
 

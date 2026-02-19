@@ -158,6 +158,8 @@ def head_types_for_n_head(n):
 def init_db(db_path: str):
     # And lo, a memory shall awaken in SQLite, because RAM is a liar.
     con = sqlite3.connect(db_path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     cur = con.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages(
@@ -636,7 +638,8 @@ class EvolvingTokenizer:
         self.vocab_size = len(self.tokens)
 
     def _apply_bpe(self, token_seq):
-        """Apply learned BPE merges to a sequence of tokens (greedy, lowest-rank first)."""
+        """Apply learned BPE merges to a sequence of tokens (greedy, lowest-rank first).
+        Uses in-place list mutation (pop+insert) instead of O(n) slice rebuilds."""
         if not self.merges:
             return token_seq
 
@@ -644,13 +647,20 @@ class EvolvingTokenizer:
         rank = {pair: i for i, pair in enumerate(self.merges)}
 
         while len(symbols) >= 2:
-            pairs = [(rank.get((symbols[i], symbols[i+1]), 10**9), i)
-                     for i in range(len(symbols) - 1)]
-            best_rank, idx = min(pairs, key=lambda x: x[0])
+            # Find pair with lowest merge rank
+            best_rank = 10**9
+            best_idx = -1
+            for i in range(len(symbols) - 1):
+                r = rank.get((symbols[i], symbols[i+1]), 10**9)
+                if r < best_rank:
+                    best_rank = r
+                    best_idx = i
             if best_rank == 10**9:
                 break
-            pair = (symbols[idx], symbols[idx+1])
-            symbols = symbols[:idx] + [self.merge_to_tok[pair]] + symbols[idx+2:]
+            pair = (symbols[best_idx], symbols[best_idx+1])
+            # In-place mutation: replace two symbols with merged token
+            symbols[best_idx] = self.merge_to_tok[pair]
+            del symbols[best_idx + 1]
         return symbols
 
     def encode(self, s: str):
@@ -976,6 +986,11 @@ def backward(root):
         if v._back_fn is not None:
             v._back_fn()
 
+    # Clean up graph references to free intermediate nodes
+    for v in topo:
+        v._children = ()
+        v._back_fn = None
+
 # ============================================================
 # 5) HIGH-LEVEL OPS — the sacred blocks
 # ============================================================
@@ -990,10 +1005,16 @@ class MatrixParam:
                      for _ in range(nout)]
         self.nout = nout
         self.nin = nin
+        self._W_cache = None
+
+    def invalidate_cache(self):
+        self._W_cache = None
 
     def matvec(self, x):
         # And lo, BLAS shall do the heavy lifting — numpy @ is 50-100x faster than Python loops.
-        W = np.vstack([row.data for row in self.rows])  # (nout, nin)
+        if self._W_cache is None:
+            self._W_cache = np.vstack([row.data for row in self.rows])  # (nout, nin)
+        W = self._W_cache
         out_data = W @ x.data  # single BLAS call
         out = VectorValue(out_data)
         if _GRAD_ENABLED:
@@ -1015,6 +1036,7 @@ class MatrixParam:
         for _ in range(new_nout - self.nout):
             self.rows.append(VectorValue([random.gauss(0, std) for _ in range(self.nin)]))
         self.nout = new_nout
+        self._W_cache = None
 
     def grow_cols(self, new_nin, std=0.02):
         # And lo, the matrix shall widen its reach, each row stretching into new dimensions.
@@ -1026,6 +1048,7 @@ class MatrixParam:
             if row.grad is not None:
                 row.grad = np.concatenate([row.grad, np.zeros(new_nin - self.nin)])
         self.nin = new_nin
+        self._W_cache = None
 
     def grow(self, new_nout, new_nin, std=0.02):
         # Ontogenesis: grow both dimensions. Cols first so new rows get full width.
@@ -1219,16 +1242,24 @@ class DeltaAdapter:
 # 7) GPT MODEL — a small beast with RoPE (GPT-3-ish spice)
 # ============================================================
 
+_ROPE_CACHE = {}
+
+def _get_rope_cos_sin(pos, head_dim):
+    """Cached RoPE cos/sin computation. Avoids recomputing thetas every call."""
+    key = (pos, head_dim)
+    if key not in _ROPE_CACHE:
+        n_pairs = head_dim // 2
+        indices = np.arange(0, 2 * n_pairs, 2, dtype=np.float64)
+        thetas = pos / (10000.0 ** (indices / head_dim))
+        _ROPE_CACHE[key] = (np.cos(thetas), np.sin(thetas))
+    return _ROPE_CACHE[key]
+
 def rope_rotate(vec, pos, head_dim):
     """
     RoPE rotation for one head slice — numpy vectorized.
     """
     # And lo, positions shall become angles, and angles shall become meaning.
-    n_pairs = head_dim // 2
-    indices = np.arange(0, 2 * n_pairs, 2, dtype=np.float64)
-    thetas = pos / (10000.0 ** (indices / head_dim))
-    cos_t = np.cos(thetas)
-    sin_t = np.sin(thetas)
+    cos_t, sin_t = _get_rope_cos_sin(pos, head_dim)
 
     x = vec.data[:head_dim].copy()
     out_data = x.copy()
@@ -1756,6 +1787,14 @@ class GPT:
             p.data -= lr * mhat / (np.sqrt(vhat) + eps)
             p.grad[:] = 0.0
 
+        # Invalidate W caches on all MatrixParams (weights changed)
+        for mp in self.base.values():
+            mp._W_cache = None
+        for mod in self.deltas:
+            for da in mod.values():
+                da.A._W_cache = None
+                da.B._W_cache = None
+
     def _apply_with_deltas(self, name, x):
         # And lo, base weight shall speak, then deltas shall harmonize atop it.
         y = self.base[name].matvec(x)
@@ -1915,16 +1954,21 @@ class GPT:
                 base_temp = 1e-6
             raw = logits.data
             raw_scaled = (raw / base_temp).tolist()
-            probs0 = softmax_probs_float(raw_scaled)
-            entropy = -sum(p * math.log(p) for p in probs0 if p > 1e-12)
+            probs = softmax_probs_float(raw_scaled)
+            # Compute entropy via numpy (vectorized, no Python loop)
+            probs_arr = np.array(probs)
+            mask = probs_arr > 1e-12
+            entropy = -float(np.sum(probs_arr[mask] * np.log(probs_arr[mask])))
             t_mul = 1.0
             if entropy < CFG.entropy_low:
                 t_mul = CFG.entropy_temp_boost
             elif entropy > CFG.entropy_high:
                 t_mul = CFG.entropy_temp_focus
-            temp = base_temp * t_mul
-            scaled = (raw / temp).tolist()
-            probs = softmax_probs_float(scaled)
+            # Only recompute softmax if temperature actually changed
+            if t_mul != 1.0:
+                temp = base_temp * t_mul
+                scaled = (raw / temp).tolist()
+                probs = softmax_probs_float(scaled)
 
             # Adaptive corpus blend: corpus field fades as model becomes coherent
             if self._corpus_field and self._corpus_field.bigram:
@@ -1996,6 +2040,7 @@ def _deserialize_matrix_param(data):
     mp.rows = [VectorValue(row) for row in data]
     mp.nout = len(data)
     mp.nin = len(data[0]) if data else 0
+    mp._W_cache = None
     return mp
 
 def save_checkpoint(model: GPT, tok: EvolvingTokenizer, path=None):

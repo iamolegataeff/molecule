@@ -617,11 +617,16 @@ func (s *Scalar) Sigmoid() *Scalar {
 	return out
 }
 
+// backwardVisitedPool reuses visited maps across Backward calls to reduce GC pressure.
+var backwardVisitedPool = sync.Pool{
+	New: func() interface{} { return make(map[Node]bool) },
+}
+
 // Backward performs reverse-mode autodiff from this node.
 // And lo, the graph shall be walked backwards, like a salmon with regrets.
 func Backward(root Node) {
 	topo := make([]Node, 0)
-	visited := make(map[Node]bool)
+	visited := backwardVisitedPool.Get().(map[Node]bool)
 
 	var build func(n Node)
 	build = func(n Node) {
@@ -635,6 +640,12 @@ func Backward(root Node) {
 		topo = append(topo, n)
 	}
 	build(root)
+
+	// Clear and return visited map to pool
+	for k := range visited {
+		delete(visited, k)
+	}
+	backwardVisitedPool.Put(visited)
 
 	// Set root gradient
 	switch r := root.(type) {
@@ -1430,6 +1441,34 @@ func (t *EvolvingTokenizer) Decode(ids []int) string {
 // 5) GPT MODEL — a small beast with RoPE
 // ============================================================
 
+// ropeCache stores pre-computed cos/sin pairs for RoPE.
+// Key: [2]int{pos, headDim}, Value: *[2][]float64{cosines, sines}
+var ropeCache sync.Map
+
+type ropePair struct {
+	cos []float64
+	sin []float64
+}
+
+func getRoPECosSin(pos, headDim int) *ropePair {
+	key := [2]int{pos, headDim}
+	if cached, ok := ropeCache.Load(key); ok {
+		return cached.(*ropePair)
+	}
+	n := headDim / 2
+	pair := &ropePair{
+		cos: make([]float64, n),
+		sin: make([]float64, n),
+	}
+	for j := 0; j < n; j++ {
+		theta := float64(pos) / math.Pow(10000.0, float64(2*j)/float64(headDim))
+		pair.cos[j] = math.Cos(theta)
+		pair.sin[j] = math.Sin(theta)
+	}
+	ropeCache.Store(key, pair)
+	return pair
+}
+
 // RoPERotate applies rotary position encoding to a head vector.
 // And lo, positions shall become angles, and angles shall become meaning.
 func RoPERotate(vec *Vec, pos int, headDim int) *Vec {
@@ -1438,10 +1477,11 @@ func RoPERotate(vec *Vec, pos int, headDim int) *Vec {
 	outData := make([]float64, len(x))
 	copy(outData, x)
 
-	for i := 0; i < headDim-1; i += 2 {
-		theta := float64(pos) / math.Pow(10000.0, float64(i)/float64(headDim))
-		c := math.Cos(theta)
-		s := math.Sin(theta)
+	rp := getRoPECosSin(pos, headDim)
+	for j := 0; j < headDim/2; j++ {
+		i := j * 2
+		c := rp.cos[j]
+		s := rp.sin[j]
 		a := x[i]
 		b := x[i+1]
 		outData[i] = a*c - b*s
@@ -1452,10 +1492,11 @@ func RoPERotate(vec *Vec, pos int, headDim int) *Vec {
 	if gradEnabled {
 		out.children = []Node{vec}
 		out.backFn = func() {
-			for i := 0; i < headDim-1; i += 2 {
-				theta := float64(pos) / math.Pow(10000.0, float64(i)/float64(headDim))
-				c := math.Cos(theta)
-				s := math.Sin(theta)
+			rpBack := getRoPECosSin(pos, headDim)
+			for j := 0; j < headDim/2; j++ {
+				i := j * 2
+				c := rpBack.cos[j]
+				s := rpBack.sin[j]
 				ga := out.Grad[i]
 				gb := out.Grad[i+1]
 				vec.Grad[i] += ga*c + gb*s
@@ -1475,6 +1516,13 @@ type GammaStatsResult struct {
 	Magnitude float64
 	TopTokens []int
 	NRows     int
+}
+
+// layerKeySet holds pre-computed string keys for a single layer, avoiding fmt.Sprintf per call.
+type layerKeySet struct {
+	wq, wk, wv, wo, fcG, fcV, fc2 string
+	headPattern []string // per head
+	headAlpha   []string // per head
 }
 
 // GPT is the full model.
@@ -1500,6 +1548,8 @@ type GPT struct {
 	growthFreezeRemaining int // ontogenesis: freeze base after growth, train only deltas
 
 	corpusField *CooccurField // set by backgroundTrainer for adaptive blend
+
+	layerKeys []layerKeySet // pre-computed string keys per layer
 
 	// inherited burst history from parent (mitosis lineage)
 	inheritedBurstHistory []BurstRecord
@@ -1556,6 +1606,31 @@ func NewGPT(tok *EvolvingTokenizer) *GPT {
 			gpt.Base[alphaKey] = NewMatrixParam(1, 1, 0.0)
 			gpt.Base[alphaKey].Rows[0].Data[0] = CFG.HybridAlphaInit
 		}
+	}
+
+	// Pre-compute layer key strings to avoid fmt.Sprintf per ForwardStep call
+	gpt.layerKeys = make([]layerKeySet, CFG.NLayer)
+	for li := 0; li < CFG.NLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		lk := layerKeySet{
+			wq:  pfx + "wq",
+			wk:  pfx + "wk",
+			wv:  pfx + "wv",
+			wo:  pfx + "wo",
+			fcG: pfx + "fc_g",
+			fcV: pfx + "fc_v",
+			fc2: pfx + "fc2",
+		}
+		nHeads := len(CFG.HeadTypes)
+		if nHeads > 0 {
+			lk.headPattern = make([]string, nHeads)
+			lk.headAlpha = make([]string, nHeads)
+			for h := 0; h < nHeads; h++ {
+				lk.headPattern[h] = fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				lk.headAlpha[h] = fmt.Sprintf("l%d.h%d.alpha", li, h)
+			}
+		}
+		gpt.layerKeys[li] = lk
 	}
 
 	gpt.AddDeltaModule(1.0)
@@ -2010,6 +2085,26 @@ func (gpt *GPT) MaybeGrowArchitecture(corpusChars int) bool {
 	// 7. Reset Adam state (old momentum is meaningless after arch change)
 	gpt.Adam = make(map[string]*AdamState)
 
+	// 7b. Rebuild layerKeys for new architecture
+	gpt.layerKeys = make([]layerKeySet, newLayer)
+	for li := 0; li < newLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		lk := layerKeySet{
+			wq: pfx + "wq", wk: pfx + "wk", wv: pfx + "wv", wo: pfx + "wo",
+			fcG: pfx + "fc_g", fcV: pfx + "fc_v", fc2: pfx + "fc2",
+		}
+		nHeads := len(CFG.HeadTypes)
+		if nHeads > 0 {
+			lk.headPattern = make([]string, nHeads)
+			lk.headAlpha = make([]string, nHeads)
+			for h := 0; h < nHeads; h++ {
+				lk.headPattern[h] = fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				lk.headAlpha[h] = fmt.Sprintf("l%d.h%d.alpha", li, h)
+			}
+		}
+		gpt.layerKeys[li] = lk
+	}
+
 	// 8. Extend gamma snapshot for new embedding dimensions
 	for i := range gpt.InitEmbedSnapshot {
 		oldRow := gpt.InitEmbedSnapshot[i]
@@ -2103,41 +2198,37 @@ func (gpt *GPT) ComputeFieldDeviation(tok *EvolvingTokenizer, field *CooccurFiel
 
 			// Try trigram
 			if pos >= 1 {
-				triTotal := 0.0
-				triCounts := make(map[int]float64)
-				for k, v := range field.Trigram {
-					if k[0] == ids[pos-1] && k[1] == ids[pos] {
-						triCounts[k[2]] = v
+				if ctx, ok := field.TrigramByContext[[2]int{ids[pos-1], ids[pos]}]; ok {
+					triTotal := 0.0
+					for _, v := range ctx {
 						triTotal += v
 					}
-				}
-				if triTotal > 0 {
-					for tid, cnt := range triCounts {
-						if tid < vocabSize {
-							fieldProbs[tid] = cnt / triTotal
+					if triTotal > 0 {
+						for tid, cnt := range ctx {
+							if tid < vocabSize {
+								fieldProbs[tid] = cnt / triTotal
+							}
 						}
+						fieldFound = true
 					}
-					fieldFound = true
 				}
 			}
 
 			// Fallback to bigram
 			if !fieldFound && pos >= 0 {
-				biTotal := 0.0
-				biCounts := make(map[int]float64)
-				for k, v := range field.Bigram {
-					if k[0] == ids[pos] {
-						biCounts[k[1]] = v
+				if ctx, ok := field.BigramByFirst[ids[pos]]; ok {
+					biTotal := 0.0
+					for _, v := range ctx {
 						biTotal += v
 					}
-				}
-				if biTotal > 0 {
-					for tid, cnt := range biCounts {
-						if tid < vocabSize {
-							fieldProbs[tid] = cnt / biTotal
+					if biTotal > 0 {
+						for tid, cnt := range ctx {
+							if tid < vocabSize {
+								fieldProbs[tid] = cnt / biTotal
+							}
 						}
+						fieldFound = true
 					}
-					fieldFound = true
 				}
 			}
 
@@ -2386,15 +2477,15 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 	x := tokEmb.Add(posEmb)
 
 	for li := 0; li < gpt.NLayer; li++ {
-		pfx := fmt.Sprintf("l%d.", li)
+		lk := gpt.layerKeys[li]
 
 		// ---- Attention ----
 		xRes := x
 		x = RMSNorm(x)
 
-		q := gpt.applyWithDeltas(pfx+"wq", x)
-		k := gpt.applyWithDeltas(pfx+"wk", x)
-		v := gpt.applyWithDeltas(pfx+"wv", x)
+		q := gpt.applyWithDeltas(lk.wq, x)
+		k := gpt.applyWithDeltas(lk.wk, x)
+		v := gpt.applyWithDeltas(lk.wv, x)
 
 		keys[li] = append(keys[li], k)
 		values[li] = append(values[li], v)
@@ -2432,7 +2523,7 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 			// RRPRAM attention logits
 			var rrpramLogits []*Scalar
 			if htype == "rrpram" || htype == "hybrid" {
-				patternKey := fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				patternKey := lk.headPattern[h]
 				xh := x.Slice(hs, he)
 				patternFull := gpt.applyWithDeltas(patternKey, xh)
 				rrpramLogits = make([]*Scalar, T)
@@ -2449,7 +2540,7 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 			case "rrpram":
 				attnWeights = ScalarSoftmax(rrpramLogits)
 			default: // hybrid
-				alphaKey := fmt.Sprintf("l%d.h%d.alpha", li, h)
+				alphaKey := lk.headAlpha[h]
 				alphaScalar := gpt.Base[alphaKey].Rows[0].Element(0) // gradient flows to MatrixParam
 				a := alphaScalar.Sigmoid()                            // learnable sigmoid gate
 				oneMinusA := a.MulF(-1.0).AddF(1.0)                  // 1 - sigmoid(alpha)
@@ -2467,18 +2558,18 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 		}
 
 		xAttn := Concat(headOutputs)
-		attnOut := gpt.applyWithDeltas(pfx+"wo", xAttn)
+		attnOut := gpt.applyWithDeltas(lk.wo, xAttn)
 		x = xRes.Add(attnOut.Scale(gpt.residualAlpha))
 
 		// ---- Gated MLP (SwiGLU-ish) ----
 		xRes = x
 		x = RMSNorm(x)
 
-		g := gpt.applyWithDeltas(pfx+"fc_g", x).SiLU() // gate (SwiGLU)
-		u := gpt.applyWithDeltas(pfx+"fc_v", x)         // value
-		mlpX := g.MulVec(u)                              // gating
+		g := gpt.applyWithDeltas(lk.fcG, x).SiLU() // gate (SwiGLU)
+		u := gpt.applyWithDeltas(lk.fcV, x)         // value
+		mlpX := g.MulVec(u)                          // gating
 
-		mlpOut := gpt.applyWithDeltas(pfx+"fc2", mlpX)
+		mlpOut := gpt.applyWithDeltas(lk.fc2, mlpX)
 		x = xRes.Add(mlpOut.Scale(gpt.residualAlpha))
 	}
 
@@ -2578,7 +2669,7 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 	}
 
 	cur := ids[len(ids)-1]
-	var outIDs []int
+	outIDs := make([]int, 0, CFG.MaxGenTokens)
 	var recent []int
 
 	eosID := gpt.Tok.Stoi[gpt.Tok.EOS]
@@ -2591,18 +2682,18 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		}
 		logits := gpt.ForwardStep(cur, pos, keys, values)
 
-		// Entropy-adaptive temperature + syntropy bridge
+		// Entropy-adaptive temperature + syntropy bridge (single softmax when possible)
 		baseTemp := CFG.Temperature + gpt.syntropyTempOff
 		if baseTemp <= 1e-6 {
 			baseTemp = 1e-6
 		}
-		rawScaled := make([]float64, len(logits.Data))
+		scaled := make([]float64, len(logits.Data))
 		for i, v := range logits.Data {
-			rawScaled[i] = v / baseTemp
+			scaled[i] = v / baseTemp
 		}
-		probs0 := SoftmaxProbs(rawScaled)
+		probs := SoftmaxProbs(scaled)
 		entropy := 0.0
-		for _, p := range probs0 {
+		for _, p := range probs {
 			if p > 1e-12 {
 				entropy -= p * math.Log(p)
 			}
@@ -2613,37 +2704,35 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		} else if entropy > CFG.EntropyHigh {
 			tMul = CFG.EntropyTempFocus
 		}
-		temp := baseTemp * tMul
-		scaled := make([]float64, len(logits.Data))
-		for i, v := range logits.Data {
-			scaled[i] = v / temp
+		if tMul != 1.0 {
+			// Only recompute softmax when temperature actually changes
+			temp := baseTemp * tMul
+			for i, v := range logits.Data {
+				scaled[i] = v / temp
+			}
+			probs = SoftmaxProbs(scaled)
 		}
-		probs := SoftmaxProbs(scaled)
 
 		// Adaptive corpus blend: corpus field fades as model becomes coherent
 		if gpt.corpusField != nil && gpt.corpusField.Built {
 			modelAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
 			if modelAlpha < 0.99 {
-				corpusDist := make(map[int]float64)
+				var corpusDist map[int]float64
 				// Try trigram first
 				if len(ids) >= 2 {
 					a, b := ids[len(ids)-2], ids[len(ids)-1]
-					for key, cnt := range gpt.corpusField.Trigram {
-						if key[0] == a && key[1] == b {
-							corpusDist[key[2]] = cnt
-						}
+					if ctx, ok := gpt.corpusField.TrigramByContext[[2]int{a, b}]; ok {
+						corpusDist = ctx
 					}
 				}
 				// Fallback to bigram
-				if len(corpusDist) == 0 && len(ids) >= 1 {
+				if corpusDist == nil && len(ids) >= 1 {
 					prev := ids[len(ids)-1]
-					for key, cnt := range gpt.corpusField.Bigram {
-						if key[0] == prev {
-							corpusDist[key[1]] = cnt
-						}
+					if ctx, ok := gpt.corpusField.BigramByFirst[prev]; ok {
+						corpusDist = ctx
 					}
 				}
-				if len(corpusDist) > 0 {
+				if corpusDist != nil && len(corpusDist) > 0 {
 					totalC := 0.0
 					for _, cnt := range corpusDist {
 						totalC += cnt
@@ -2691,15 +2780,14 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 			}
 		}
 
-		// Check for sentence ending
-		decIDs := []int{bosID}
-		decIDs = append(decIDs, outIDs...)
-		decIDs = append(decIDs, eosID)
-		textNow := gpt.Tok.Decode(decIDs)
-		if step >= CFG.MinGenTokens && len(textNow) > 0 {
-			last := textNow[len(textNow)-1]
-			if last == '.' || last == '!' || last == '?' {
-				break
+		// Check for sentence ending — decode only the last token to avoid full rebuild
+		if step >= CFG.MinGenTokens {
+			lastDecoded := gpt.Tok.Decode([]int{bosID, nxt, eosID})
+			if len(lastDecoded) > 0 {
+				lastByte := lastDecoded[len(lastDecoded)-1]
+				if lastByte == '.' || lastByte == '!' || lastByte == '?' {
+					break
+				}
 			}
 		}
 
@@ -3355,34 +3443,42 @@ func (qb *QuantumBuffer) Reset() {
 
 // And lo, the corpus shall whisper its statistics, and words shall follow words.
 type CooccurField struct {
-	Unigram  map[int]float64
-	Bigram   map[[2]int]float64
-	Trigram  map[[3]int]float64
-	Built    bool
+	Unigram          map[int]float64
+	BigramByFirst    map[int]map[int]float64    // prev → {next: count}
+	TrigramByContext map[[2]int]map[int]float64  // [prev2,prev1] → {next: count}
+	Built            bool
 }
 
 func NewCooccurField() *CooccurField {
 	return &CooccurField{
-		Unigram: make(map[int]float64),
-		Bigram:  make(map[[2]int]float64),
-		Trigram: make(map[[3]int]float64),
+		Unigram:          make(map[int]float64),
+		BigramByFirst:    make(map[int]map[int]float64),
+		TrigramByContext: make(map[[2]int]map[int]float64),
 	}
 }
 
 func (cf *CooccurField) BuildFromCorpus(tok *EvolvingTokenizer, docs []string) {
 	cf.Unigram = make(map[int]float64)
-	cf.Bigram = make(map[[2]int]float64)
-	cf.Trigram = make(map[[3]int]float64)
+	cf.BigramByFirst = make(map[int]map[int]float64)
+	cf.TrigramByContext = make(map[[2]int]map[int]float64)
 	for _, doc := range docs {
 		ids := tok.Encode(doc)
 		for _, id := range ids {
 			cf.Unigram[id]++
 		}
 		for i := 0; i < len(ids)-1; i++ {
-			cf.Bigram[[2]int{ids[i], ids[i+1]}]++
+			first, second := ids[i], ids[i+1]
+			if cf.BigramByFirst[first] == nil {
+				cf.BigramByFirst[first] = make(map[int]float64)
+			}
+			cf.BigramByFirst[first][second]++
 		}
 		for i := 0; i < len(ids)-2; i++ {
-			cf.Trigram[[3]int{ids[i], ids[i+1], ids[i+2]}]++
+			ctx := [2]int{ids[i], ids[i+1]}
+			if cf.TrigramByContext[ctx] == nil {
+				cf.TrigramByContext[ctx] = make(map[int]float64)
+			}
+			cf.TrigramByContext[ctx][ids[i+2]]++
 		}
 	}
 	cf.Built = true
@@ -3395,9 +3491,9 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 	// Try trigram
 	if len(contextIDs) >= 2 {
 		a, b := contextIDs[len(contextIDs)-2], contextIDs[len(contextIDs)-1]
-		for k, v := range cf.Trigram {
-			if k[0] == a && k[1] == b {
-				counts[k[2]] += v
+		if ctx, ok := cf.TrigramByContext[[2]int{a, b}]; ok {
+			for tid, v := range ctx {
+				counts[tid] += v
 				found = true
 			}
 		}
@@ -3406,9 +3502,9 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 	// Fallback to bigram
 	if !found && len(contextIDs) >= 1 {
 		prev := contextIDs[len(contextIDs)-1]
-		for k, v := range cf.Bigram {
-			if k[0] == prev {
-				counts[k[1]] += v
+		if ctx, ok := cf.BigramByFirst[prev]; ok {
+			for tid, v := range ctx {
+				counts[tid] += v
 				found = true
 			}
 		}
@@ -3535,18 +3631,22 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		corpusTotal := 0.0
 		if len(ctxForCorpus) >= 2 {
 			a, b := ctxForCorpus[len(ctxForCorpus)-2], ctxForCorpus[len(ctxForCorpus)-1]
-			for k, v := range field.Trigram {
-				if k[0] == a && k[1] == b && int(k[2]) < tok.VocabSize {
-					corpusCounts[k[2]] += v
-					corpusTotal += v // And lo, the trigram shall be counted properly
+			if ctx, ok := field.TrigramByContext[[2]int{a, b}]; ok {
+				for tid, v := range ctx {
+					if tid < tok.VocabSize {
+						corpusCounts[tid] += v
+						corpusTotal += v // And lo, the trigram shall be counted properly
+					}
 				}
 			}
 		}
 		if corpusTotal == 0 && len(ctxForCorpus) >= 1 {
 			prev := ctxForCorpus[len(ctxForCorpus)-1]
-			for k, v := range field.Bigram {
-				if k[0] == prev && int(k[1]) < tok.VocabSize {
-					corpusCounts[k[1]] += v
+			if ctx, ok := field.BigramByFirst[prev]; ok {
+				for tid, v := range ctx {
+					if tid < tok.VocabSize {
+						corpusCounts[tid] += v
+					}
 				}
 			}
 		}
