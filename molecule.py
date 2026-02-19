@@ -2098,6 +2098,9 @@ class SyntropyTracker:
         self.purpose_alignment = 0.0  # cosine(purpose, gamma)
         self.last_action = "none"     # what was decided last time
         self.burst_history = []       # last 16 burst outcomes — training efficiency memory
+        self.model_stage = 0          # current growth stage (set during measure)
+        self._last_mitosis_time = 0.0 # cooldown for divide
+        self._swarm_info = None       # peer state from mesh.db (set externally)
 
     def record_burst(self, action, loss_before, loss_after):
         """Log a burst outcome for self-meta-learning."""
@@ -2115,6 +2118,7 @@ class SyntropyTracker:
     def measure(self, model, tok, field, docs):
         """Take all measurements. This is the organism looking at itself
         through mathematical instruments."""
+        self.model_stage = model.current_growth_stage()
         entropy_now = model.compute_model_entropy(tok, docs)
         self.entropy_history.append(entropy_now)
         if len(self.entropy_history) > CFG.syntropy_window:
@@ -2189,8 +2193,20 @@ class SyntropyTracker:
             temp_offset = 0.0
             action = "realign"
 
+        # CASE 6: Adult + sustained overload → divide (mitosis)
+        max_stage = len(CFG.growth_stages) - 1
+        if (self.model_stage >= max_stage and
+                self._is_sustained_overload() and
+                time.time() - self._last_mitosis_time > 300):
+            action = "divide"
+            lr_multiplier = CFG.syntropy_lr_dampen  # slow down while preparing to split
+
+        # CASE 7: Plateau + young peer thriving → hibernate (cooperative scheduling)
+        if (action == "steady" and self._should_hibernate()):
+            action = "hibernate"
+
         # SELF-META-LEARNING: check if this action historically hurts
-        if len(self.burst_history) >= 4:
+        if action not in ("divide", "hibernate") and len(self.burst_history) >= 4:
             eff, count = self.action_effectiveness(action)
             if count >= 2 and eff > 0.05:
                 # This action consistently makes loss WORSE — downgrade
@@ -2210,6 +2226,30 @@ class SyntropyTracker:
             "delta_grow_override": delta_grow_override,
             "action": action,
         }
+
+    def _is_sustained_overload(self):
+        """High entropy for >75% of window + falling syntropy = overloaded."""
+        if len(self.entropy_history) < CFG.syntropy_window:
+            return False
+        recent = self.entropy_history[-CFG.syntropy_window:]
+        high_count = sum(1 for e in recent if e > CFG.entropy_high)
+        return high_count > CFG.syntropy_window * 0.75 and self.syntropy_trend < -0.02
+
+    def _should_hibernate(self):
+        """Should this organism sleep to give resources to peers?
+        Conditions: loss on plateau + a peer is in amplify/boost state."""
+        if not self._swarm_info or not self._swarm_info.get("peers"):
+            return False
+        # Check if any peer has higher syntropy trend (actively improving)
+        for peer in self._swarm_info["peers"]:
+            if peer.get("syntropy", 0) > 0.05:
+                # A young peer is thriving. If we're stale, hibernate.
+                if len(self.burst_history) >= 8:
+                    recent_deltas = [b["loss_after"] - b["loss_before"] for b in self.burst_history[-8:]]
+                    avg_delta = sum(recent_deltas) / len(recent_deltas)
+                    if abs(avg_delta) < 0.01:  # loss plateau
+                        return True
+        return False
 
     def log_to_db(self, con, entropy_before, entropy_after, action):
         """Write the mathematical conclusion to the syntropy log."""
@@ -2307,15 +2347,171 @@ class QuantumBuffer:
         self.last_burst_time = time.time()
 
 
-async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
+# ============================================================
+# 9.7) SWARM ECOLOGY — the organism learns it is not alone
+# ============================================================
+# And lo, the first cell shall call into the void and hear only silence.
+# But the second shall call and hear an answer.
+
+SWARM_DIR = os.path.expanduser("~/.molecule/swarm")
+
+class SwarmRegistry:
+    """Discover and track other molecule instances via shared SQLite."""
+
+    def __init__(self, organism_id=None):
+        self.organism_id = organism_id or f"org_{os.getpid()}_{int(time.time())}"
+        self.pid_file = None
+        self.mesh_db = None
+
+    def register(self):
+        """Write PID file and register in mesh.db."""
+        os.makedirs(SWARM_DIR, exist_ok=True)
+        self.pid_file = os.path.join(SWARM_DIR, f"{self.organism_id}.pid")
+        with open(self.pid_file, "w") as f:
+            json.dump({"pid": os.getpid(), "organism_id": self.organism_id,
+                        "started": time.time()}, f)
+        self._init_mesh_db()
+        self._register_in_mesh()
+
+    def _init_mesh_db(self):
+        db_path = os.path.join(SWARM_DIR, "mesh.db")
+        self.mesh_db = sqlite3.connect(db_path, timeout=5.0)
+        self.mesh_db.execute("PRAGMA journal_mode=WAL")
+        self.mesh_db.execute("""
+            CREATE TABLE IF NOT EXISTS organisms(
+                id TEXT PRIMARY KEY, pid INTEGER, stage INTEGER,
+                n_params INTEGER, syntropy REAL, entropy REAL,
+                last_heartbeat REAL, parent_id TEXT,
+                status TEXT DEFAULT 'alive')""")
+        self.mesh_db.execute("""
+            CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id TEXT, to_id TEXT, type TEXT, payload TEXT, ts REAL)""")
+        self.mesh_db.commit()
+
+    def _register_in_mesh(self):
+        self.mesh_db.execute(
+            "INSERT OR REPLACE INTO organisms(id,pid,stage,n_params,syntropy,entropy,last_heartbeat,status) "
+            "VALUES(?,?,0,0,0.0,0.0,?,'alive')",
+            (self.organism_id, os.getpid(), time.time()))
+        self.mesh_db.commit()
+
+    def heartbeat(self, stage, n_params, syntropy, entropy):
+        """Periodic state update in mesh.db."""
+        if not self.mesh_db:
+            return
+        self.mesh_db.execute(
+            "UPDATE organisms SET stage=?,n_params=?,syntropy=?,entropy=?,last_heartbeat=?,status='alive' WHERE id=?",
+            (stage, n_params, syntropy, entropy, time.time(), self.organism_id))
+        self.mesh_db.commit()
+
+    def discover_peers(self, timeout_seconds=60):
+        """Find other living organisms."""
+        if not self.mesh_db:
+            return []
+        cutoff = time.time() - timeout_seconds
+        cur = self.mesh_db.execute(
+            "SELECT id,pid,stage,n_params,syntropy,entropy,status FROM organisms "
+            "WHERE status='alive' AND last_heartbeat>? AND id!=?",
+            (cutoff, self.organism_id))
+        return [{"id": r[0], "pid": r[1], "stage": r[2], "n_params": r[3],
+                 "syntropy": r[4], "entropy": r[5], "status": r[6]} for r in cur.fetchall()]
+
+    def mark_hibernating(self):
+        """Mark this organism as sleeping in mesh.db."""
+        if self.mesh_db:
+            self.mesh_db.execute("UPDATE organisms SET status='sleeping' WHERE id=?",
+                                 (self.organism_id,))
+            self.mesh_db.commit()
+
+    def log_message(self, to_id, msg_type, payload):
+        """Log a message between organisms."""
+        if self.mesh_db:
+            self.mesh_db.execute(
+                "INSERT INTO messages(from_id,to_id,type,payload,ts) VALUES(?,?,?,?,?)",
+                (self.organism_id, to_id, msg_type, json.dumps(payload), time.time()))
+            self.mesh_db.commit()
+
+    def unregister(self):
+        """Clean up on exit."""
+        if self.mesh_db:
+            self.mesh_db.execute("UPDATE organisms SET status='dead' WHERE id=?",
+                                 (self.organism_id,))
+            self.mesh_db.commit()
+            self.mesh_db.close()
+            self.mesh_db = None
+        if self.pid_file and os.path.exists(self.pid_file):
+            os.unlink(self.pid_file)
+
+
+import sys as _sys
+
+async def perform_mitosis(model, tok, con, swarm, syntracker):
+    """The organism divides. Parent continues. Child starts at infant stage."""
+    child_id = f"org_{int(time.time())}_{random.randint(1000,9999)}"
+    child_dir = os.path.expanduser(f"~/.molecule/{child_id}")
+    os.makedirs(child_dir, exist_ok=True)
+
+    # Save parent checkpoint for child's reference
+    parent_ckpt = os.path.join(child_dir, "parent_ckpt.json")
+    save_checkpoint(model, tok, parent_ckpt)
+
+    # Write birth config with inherited memory
+    birth = {
+        "organism_id": child_id,
+        "parent_id": swarm.organism_id,
+        "corpus_path": CFG.corpus_path,
+        "db_path": os.path.join(child_dir, "memory.sqlite3"),
+        "ckpt_path": os.path.join(child_dir, "molecule_ckpt.json"),
+        "burst_history": syntracker.burst_history,
+    }
+    birth_path = os.path.join(child_dir, "birth.json")
+    with open(birth_path, "w") as f:
+        json.dump(birth, f)
+
+    # Log in mesh
+    swarm.log_message(child_id, "mitosis:spawn",
+                      {"parent_stage": model.current_growth_stage()})
+    db_log_growth(con, model, tok, load_corpus_lines(CFG.corpus_path),
+                  note=f"mitosis:spawn:{child_id}")
+
+    # Spawn child process
+    child_proc = await asyncio.create_subprocess_exec(
+        _sys.executable, os.path.abspath(__file__),
+        "--organism-id", child_id, "--config", birth_path)
+
+    syntracker._last_mitosis_time = time.time()
+    print(f"[ecology] Child {child_id} spawned (pid={child_proc.pid})")
+    return child_id
+
+
+def perform_hibernation(model, tok, con, swarm):
+    """The organism sleeps. Saves state, marks sleeping, exits."""
+    print(f"[ecology] HIBERNATION — organism {swarm.organism_id} going to sleep")
+    save_checkpoint(model, tok)
+    swarm.mark_hibernating()
+    db_log_growth(con, model, tok, load_corpus_lines(CFG.corpus_path),
+                  note=f"hibernate:{swarm.organism_id}")
+
+
+async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None):
     # And lo, asynchronous training shall occur, because sleeping is for humans.
     last_event_id = 0
     warmed_up = False
     qbuf = QuantumBuffer()
     syntracker = SyntropyTracker()
     field = CooccurField()
+    tick_count = 0
+
+    # Inherit burst_history from parent (mitosis lineage)
+    inherited = getattr(model, '_inherited_burst_history', None)
+    if inherited:
+        syntracker.burst_history = list(inherited)
+        print(f"[ecology] syntracker inherited {len(inherited)} burst records from parent.")
+        del model._inherited_burst_history
 
     while True:
+        tick_count += 1
         _ = update_reservoir_corpus(con, CFG.corpus_path, CFG.max_corpus_lines)
         mass, last_event_id = compute_new_corpus_mass(con, last_event_id)
         docs = load_corpus_lines(CFG.corpus_path)
@@ -2431,6 +2627,25 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                         db_log_growth(con, model, tok, docs,
                                       note=f"ontogenesis:stage={model.current_growth_stage()}|params={n_p}")
 
+                # Ecology: mitosis / hibernation
+                if swarm and action == "divide":
+                    print("[ecology] MITOSIS triggered — organism overloaded, spawning child")
+                    await perform_mitosis(model, tok, con, swarm, syntracker)
+
+                if swarm and action == "hibernate":
+                    perform_hibernation(model, tok, con, swarm)
+                    print("[ecology] Organism hibernating. Goodbye.")
+                    return  # exit training loop
+
+        # Swarm heartbeat (every 10 ticks)
+        if swarm and tick_count % 10 == 0:
+            stage = model.current_growth_stage()
+            n_p = sum(len(r.data) for r in model.all_base_params())
+            swarm.heartbeat(stage, n_p, syntracker.syntropy_trend,
+                            syntracker.entropy_history[-1] if syntracker.entropy_history else 0.0)
+            # Update swarm info for hibernate decisions
+            syntracker._swarm_info = {"peers": swarm.discover_peers()}
+
         await asyncio.sleep(CFG.train_tick_seconds)
 
 # ============================================================
@@ -2462,7 +2677,33 @@ def build_prompt_from_memory(con, user_text):
 
 
 
+def _parse_cli_args():
+    """Parse CLI arguments for child organisms."""
+    args = {"organism_id": None, "config": None}
+    i = 1
+    while i < len(_sys.argv):
+        if _sys.argv[i] == "--organism-id" and i + 1 < len(_sys.argv):
+            args["organism_id"] = _sys.argv[i + 1]
+            i += 2
+        elif _sys.argv[i] == "--config" and i + 1 < len(_sys.argv):
+            args["config"] = _sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    return args
+
+
 async def chat_main():
+    cli = _parse_cli_args()
+
+    # Child organism: load birth config from parent
+    if cli["config"] and os.path.exists(cli["config"]):
+        with open(cli["config"], "r") as f:
+            birth = json.load(f)
+        CFG.corpus_path = birth.get("corpus_path", CFG.corpus_path)
+        CFG.db_path = birth.get("db_path", CFG.db_path)
+        CFG.ckpt_path = birth.get("ckpt_path", CFG.ckpt_path)
+
     con = init_db(CFG.db_path)
 
     if not os.path.exists(CFG.corpus_path):
@@ -2480,7 +2721,31 @@ async def chat_main():
     # Ensure tokenizer evolution can expand model
     model.maybe_expand_vocab(tok.vocab_size)
 
-    trainer_task = asyncio.create_task(background_trainer(con, model, tok))
+    # Swarm ecology: register in mesh
+    swarm = SwarmRegistry(organism_id=cli.get("organism_id"))
+    swarm.register()
+    peers = swarm.discover_peers()
+    if peers:
+        print(f"[ecology] Joined swarm. {len(peers)} peer(s) detected.")
+    else:
+        print("[ecology] First organism in the swarm.")
+
+    # Child: inherit burst_history from parent
+    syntracker_seed = None
+    if cli["config"] and os.path.exists(cli["config"]):
+        with open(cli["config"], "r") as f:
+            birth = json.load(f)
+        if "burst_history" in birth:
+            syntracker_seed = birth["burst_history"]
+            print(f"[ecology] Inherited {len(syntracker_seed)} burst records from parent.")
+
+    trainer_task = asyncio.create_task(
+        background_trainer(con, model, tok, swarm=swarm))
+
+    # If child with syntracker_seed, we need to inject it
+    # (syntracker is created inside background_trainer, so we pass via model attribute)
+    if syntracker_seed:
+        model._inherited_burst_history = syntracker_seed
 
     print("molecule is alive. Type and press Enter. Ctrl+C to exit.\n")
     try:
@@ -2510,6 +2775,7 @@ async def chat_main():
         except asyncio.CancelledError:
             pass
         save_checkpoint(model, tok)
+        swarm.unregister()
         con.close()
 
 # ============================================================
