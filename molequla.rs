@@ -1056,26 +1056,67 @@ impl GPT {
                 vs.push(self.apply_with_deltas_raw(&format!("{}.wv", p), &xn));
             }
 
-            // Attention per head
+            // Attention per head (content, rrpram, or hybrid)
             let mut attn_outs: Vec<Vec<f64>> = vec![vec![0.0; ne]; seq_len];
             for h in 0..nh {
                 let hs = h * hd;
                 let he = hs + hd;
+                let htype = if h < self.head_types.len() {
+                    self.head_types[h].as_str()
+                } else { "content" };
+
                 for t in 0..seq_len {
-                    // Compute attention weights for position t
-                    let qh = rope_raw(&qs[t][hs..he], t, hd);
-                    let mut logits = Vec::with_capacity(t + 1);
-                    for s in 0..=t {
-                        let kh = rope_raw(&ks[s][hs..he], s, hd);
-                        let mut dot = 0.0;
-                        for j in 0..hd { dot += qh[j] * kh[j]; }
-                        logits.push(dot / (hd as f64).sqrt());
-                    }
-                    // Softmax
-                    let probs = softmax_raw(&logits);
-                    // Weighted sum of values
+                    let causal_len = t + 1;
+
+                    // Content attention logits (QK^T / sqrt(d) + RoPE)
+                    let content_logits: Option<Vec<f64>> = if htype == "content" || htype == "hybrid" {
+                        let qh = rope_raw(&qs[t][hs..he], t, hd);
+                        let mut logits = Vec::with_capacity(causal_len);
+                        let inv_sqrt = 1.0 / (hd as f64).sqrt();
+                        for s in 0..causal_len {
+                            let kh = rope_raw(&ks[s][hs..he], s, hd);
+                            let mut dot = 0.0;
+                            for j in 0..hd { dot += qh[j] * kh[j]; }
+                            logits.push(dot * inv_sqrt);
+                        }
+                        Some(logits)
+                    } else { None };
+
+                    // RRPRAM attention logits (W_pattern @ xh -> positional scores)
+                    let rrpram_logits: Option<Vec<f64>> = if htype == "rrpram" || htype == "hybrid" {
+                        let xh: Vec<f64> = xs[t][hs..he].to_vec();
+                        let pkey = format!("{}.h{}.w_pattern", p, h);
+                        let pattern_full = self.apply_with_deltas_raw(&pkey, &xh);
+                        let p_len = pattern_full.len();
+                        let mut logits = Vec::with_capacity(causal_len);
+                        for s in 0..causal_len {
+                            let idx = if s < p_len { s } else { p_len - 1 };
+                            logits.push(pattern_full[idx]);
+                        }
+                        Some(logits)
+                    } else { None };
+
+                    // Dispatch by head type
+                    let final_logits = match htype {
+                        "content" => content_logits.unwrap(),
+                        "rrpram" => rrpram_logits.unwrap(),
+                        _ => { // hybrid: sigmoid(alpha) blend
+                            let akey = format!("{}.h{}.alpha", p, h);
+                            let alpha_raw = if let Some(m) = self.base.get(&akey) {
+                                m.data[0][0]
+                            } else { 0.5 };
+                            let a = 1.0 / (1.0 + (-alpha_raw).exp()); // sigmoid
+                            let cl = content_logits.unwrap();
+                            let rl = rrpram_logits.unwrap();
+                            cl.iter().zip(rl.iter())
+                                .map(|(&c, &r)| (1.0 - a) * c + a * r)
+                                .collect()
+                        }
+                    };
+
+                    let probs = softmax_raw(&final_logits);
                     let mut head_out = vec![0.0; hd];
-                    for s in 0..=t {
+                    for s in 0..causal_len {
                         for j in 0..hd { head_out[j] += probs[s] * vs[s][hs + j]; }
                     }
                     for j in 0..hd { attn_outs[t][hs + j] = head_out[j]; }
@@ -1145,25 +1186,76 @@ impl GPT {
                 vs_n.push(self.apply_with_deltas_tape(tape, &format!("{}.wv", p), xn));
             }
 
-            // Attention per head
+            // Attention per head (content, rrpram, or hybrid)
             let mut head_concat = vec![Vec::new(); len];
             for h in 0..nh {
                 let hs = h * hd;
                 let he = hs + hd;
+                let htype = if h < self.head_types.len() {
+                    self.head_types[h].as_str()
+                } else { "content" };
+
                 for t in 0..len {
-                    let qh = tape.slice(qs[t], hs, he);
-                    let qh_r = tape.rope(qh, t, hd);
-                    let mut logit_nodes = Vec::with_capacity(t + 1);
-                    let mut val_nodes = Vec::with_capacity(t + 1);
-                    for s in 0..=t {
-                        let kh = tape.slice(ks[s], hs, he);
-                        let kh_r = tape.rope(kh, s, hd);
-                        let dot_val = tape.dot(qh_r, kh_r);
-                        let scaled = tape.scalar_mulf(dot_val, 1.0 / (hd as f64).sqrt());
-                        logit_nodes.push(scaled);
+                    let causal_len = t + 1;
+                    let mut val_nodes = Vec::with_capacity(causal_len);
+                    for s in 0..causal_len {
                         val_nodes.push(tape.slice(vs_n[s], hs, he));
                     }
-                    let attn_out = tape.softmax_attn(&logit_nodes, &val_nodes);
+
+                    // Content attention logits
+                    let content_logits: Option<Vec<NodeId>> = if htype == "content" || htype == "hybrid" {
+                        let qh = tape.slice(qs[t], hs, he);
+                        let qh_r = tape.rope(qh, t, hd);
+                        let inv_sqrt = 1.0 / (hd as f64).sqrt();
+                        let mut logits = Vec::with_capacity(causal_len);
+                        for s in 0..causal_len {
+                            let kh = tape.slice(ks[s], hs, he);
+                            let kh_r = tape.rope(kh, s, hd);
+                            let dot_val = tape.dot(qh_r, kh_r);
+                            logits.push(tape.scalar_mulf(dot_val, inv_sqrt));
+                        }
+                        Some(logits)
+                    } else { None };
+
+                    // RRPRAM attention logits
+                    let rrpram_logits: Option<Vec<NodeId>> = if htype == "rrpram" || htype == "hybrid" {
+                        let xh = tape.slice(x_nodes[t], hs, he);
+                        let pkey = format!("{}.h{}.w_pattern", p, h);
+                        let pattern_full = self.apply_with_deltas_tape(tape, &pkey, xh);
+                        let p_len = self.base.get(&pkey).map_or(self.block_size, |m| m.data.len());
+                        let mut logits = Vec::with_capacity(causal_len);
+                        for s in 0..causal_len {
+                            let idx = if s < p_len { s } else { p_len - 1 };
+                            logits.push(tape.element(pattern_full, idx));
+                        }
+                        Some(logits)
+                    } else { None };
+
+                    // Dispatch by head type
+                    let final_logits = match htype {
+                        "content" => content_logits.unwrap(),
+                        "rrpram" => rrpram_logits.unwrap(),
+                        _ => { // hybrid: sigmoid(alpha) blend
+                            let akey = format!("{}.h{}.alpha", p, h);
+                            let alpha_row = tape.embed_lookup(
+                                MatRef::Base(akey.clone()), 0, &self.base[&akey].data[0]);
+                            let alpha_scalar = tape.element(alpha_row, 0);
+                            let a = tape.sigmoid(alpha_scalar);
+                            let neg_a = tape.scalar_mulf(a, -1.0);
+                            let one_minus_a = tape.scalar_addf(neg_a, 1.0);
+                            let cl = content_logits.unwrap();
+                            let rl = rrpram_logits.unwrap();
+                            let mut blended = Vec::with_capacity(cl.len());
+                            for i in 0..cl.len() {
+                                let c_scaled = tape.scalar_mul(cl[i], one_minus_a);
+                                let r_scaled = tape.scalar_mul(rl[i], a);
+                                blended.push(tape.scalar_add(c_scaled, r_scaled));
+                            }
+                            blended
+                        }
+                    };
+
+                    let attn_out = tape.softmax_attn(&final_logits, &val_nodes);
                     head_concat[t].push(attn_out);
                 }
             }
