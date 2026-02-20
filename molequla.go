@@ -5139,9 +5139,10 @@ func main() {
 			SaveCheckpoint(model, tok, "")
 
 			// Demo: show what the organism can say at this stage
+			// Use model+corpus blend (same as normal REPL) so corpus field helps early stages speak
 			fmt.Printf("\n[stage %d — %s] What it sounds like now:\n", stage, stageName)
 			for _, probe := range stageProbes {
-				answer := GenerateResonant(model, tok, tmpCooccur, probe, docs, false, 1.0)
+				answer := GenerateResonant(model, tok, tmpCooccur, probe, docs, true, 0.5)
 				if answer == "" {
 					answer = "..."
 				}
@@ -5167,7 +5168,7 @@ func main() {
 					if line == "/grow" || line == "" {
 						break
 					}
-					answer := GenerateResonant(model, tok, tmpCooccur, line, docs, true, 1.0)
+					answer := GenerateResonant(model, tok, tmpCooccur, line, docs, true, 0.5)
 					if answer == "" {
 						answer = "..."
 					}
