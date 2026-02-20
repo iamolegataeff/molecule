@@ -27,7 +27,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/ariannamethod/molequla/accel"
 	_ "modernc.org/sqlite"
 )
 
@@ -742,7 +741,7 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 	outData := make([]float64, nout)
 
 	// BLAS fast path: cblas_dgemv for both training and inference forward pass
-	if accel.HasAccel && nout*nin >= 256 {
+	if hasBLAS && nout*nin >= 256 {
 		needed := nout * nin
 		buf := accelBufPool.Get().([]float64)
 		if cap(buf) < needed {
@@ -753,7 +752,7 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 		for i := 0; i < nout; i++ {
 			copy(buf[i*nin:], m.Rows[i].Data[:nin])
 		}
-		accel.Dgemv(nout, nin, buf, x.Data, outData)
+		blasDgemv(nout, nin, buf, x.Data, outData)
 		accelBufPool.Put(buf[:0])
 	} else {
 		for i := 0; i < nout; i++ {

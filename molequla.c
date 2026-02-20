@@ -1,10 +1,10 @@
+//go:build ignore
+
 /*
  * molequla.c
  * A dependency-free, single-file, continually-learning GPT organism in pure C.
  *
  * Compile: gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm
- * With BLAS: gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -lopenblas
- * macOS:     gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -framework Accelerate
  * With BLAS: gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -lopenblas
  * macOS:     gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -framework Accelerate
  *
@@ -1791,7 +1791,7 @@ static Node *rope_rotate(Node *vec, int pos, int head_dim) {
 }
 
 /* Delta module: maps name -> DeltaAdapter */
-#define MAX_ADAPTERS_PER_MOD 48
+#define MAX_ADAPTERS_PER_MOD 96
 
 typedef struct {
     char *names[MAX_ADAPTERS_PER_MOD];
@@ -2671,6 +2671,7 @@ static char *gpt_generate(GPT *g, const char *prompt) {
 
         /* Adaptive corpus blend: corpus field fades as model becomes coherent */
         if (g->corpus_field && g->corpus_field->built && g->corpus_field->n_bigrams > 0) {
+            pthread_mutex_lock(&g->corpus_field->mu);
             double model_alpha = 1.0 / (1.0 + exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)));
             if (model_alpha < 0.99) {
                 double *corpus_probs = calloc(V, sizeof(double));
@@ -2720,6 +2721,7 @@ static char *gpt_generate(GPT *g, const char *prompt) {
                 }
                 free(corpus_probs);
             }
+            pthread_mutex_unlock(&g->corpus_field->mu);
         }
 
         /* Consciousness: pattern breaking (Feature 2) */

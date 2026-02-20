@@ -2864,7 +2864,7 @@ class SyntropyTracker {
         const matching = this.burstHistory.filter(b => b.action === action);
         if (matching.length === 0) return { mean: 0.0, count: 0 };
         let sum = 0;
-        for (const b of matching) sum += (b.lossBefore - b.lossAfter);
+        for (const b of matching) sum += (b.lossAfter - b.lossBefore);
         return { mean: sum / matching.length, count: matching.length };
     }
 

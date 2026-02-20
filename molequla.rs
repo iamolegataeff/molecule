@@ -1263,7 +1263,8 @@ impl GPT {
             // Apply wo + residual
             for t in 0..seq_len {
                 let wo_out = self.apply_with_deltas_raw(&format!("{}.wo", p), &attn_outs[t]);
-                for j in 0..ne { xs[t] = x_residuals[t].clone(); xs[t][j] += ra * wo_out[j]; }
+                xs[t] = x_residuals[t].clone();
+                for j in 0..ne { xs[t][j] += ra * wo_out[j]; }
             }
 
             // MLP: SwiGLU
@@ -2445,7 +2446,11 @@ fn load_corpus(path: &str, max_lines: usize, max_chars: usize) -> Vec<String> {
     match fs::read_to_string(path) {
         Ok(content) => content.lines()
             .take(max_lines)
-            .map(|l| if l.len() > max_chars { l[..max_chars].to_string() } else { l.to_string() })
+            .map(|l| if l.len() > max_chars {
+                let mut end = max_chars;
+                while end > 0 && !l.is_char_boundary(end) { end -= 1; }
+                l[..end].to_string()
+            } else { l.to_string() })
             .filter(|l| !l.trim().is_empty())
             .collect(),
         Err(_) => vec!["Hello.".into(), "I exist.".into(), "Speak.".into()],

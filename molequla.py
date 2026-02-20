@@ -495,6 +495,7 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
     cur = ids[-1]
     out_ids = []
     recent_buf = []
+    token_counts = {}
     eos_id = tok.stoi.get(tok.EOS, -1)
     bos_id = tok.stoi.get(tok.BOS, -1)
 
@@ -578,6 +579,17 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
         if step >= CFG.anti_field_min_step and CFG.anti_field_prob > 0 and random.random() < CFG.anti_field_prob:
             probs = model_probs  # pure model voice, bypass corpus
 
+        # Frequency/presence penalty
+        if CFG.freq_penalty > 0 or CFG.presence_penalty > 0:
+            raw = logits.data.copy()
+            for tid in token_counts:
+                cnt = token_counts[tid]
+                if cnt > 0:
+                    raw[tid] -= CFG.freq_penalty * cnt
+                    raw[tid] -= CFG.presence_penalty
+            scaled_p = (raw / temp).tolist()
+            probs = softmax_probs_float(scaled_p)
+
         nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
         if nxt == eos_id and step >= CFG.min_gen_tokens:
             break
@@ -587,6 +599,7 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
         ids.append(nxt)
         cur = nxt
         out_ids.append(nxt)
+        token_counts[nxt] = token_counts.get(nxt, 0) + 1
 
         # Repetition guard: break if last rg*2 tokens are a repeating pattern
         recent_buf.append(nxt)
