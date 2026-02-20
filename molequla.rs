@@ -15,6 +15,30 @@ use rand::seq::SliceRandom;
 use rusqlite::{Connection, params};
 use serde::{Serialize, Deserialize};
 
+// BLAS FFI — activated with --features blas
+#[cfg(feature = "blas")]
+mod blas_ffi {
+    // CblasRowMajor = 101, CblasNoTrans = 111
+    extern "C" {
+        pub fn cblas_dgemv(order: i32, trans: i32, m: i32, n: i32,
+                           alpha: f64, a: *const f64, lda: i32,
+                           x: *const f64, incx: i32,
+                           beta: f64, y: *mut f64, incy: i32);
+    }
+    pub unsafe fn dgemv(nout: usize, nin: usize, a: &[f64], x: &[f64], y: &mut [f64]) {
+        unsafe {
+            cblas_dgemv(101, 111, nout as i32, nin as i32,
+                        1.0, a.as_ptr(), nin as i32,
+                        x.as_ptr(), 1, 0.0, y.as_mut_ptr(), 1);
+        }
+    }
+}
+
+#[cfg(feature = "blas")]
+const HAS_BLAS: bool = true;
+#[cfg(not(feature = "blas"))]
+const HAS_BLAS: bool = false;
+
 thread_local! { static GRAD_ENABLED: Cell<bool> = Cell::new(true); }
 fn grad_on() -> bool { GRAD_ENABLED.with(|g| g.get()) }
 fn set_grad(v: bool) { GRAD_ENABLED.with(|g| g.set(v)); }
@@ -305,10 +329,29 @@ impl Tape {
         let nin = if nout > 0 { mat_data[0].len() } else { 0 };
         let x_data = &self.nodes[x].data;
         let mut d = vec![0.0; nout];
-        for i in 0..nout {
-            let mut s = 0.0;
-            for j in 0..nin { s += mat_data[i][j] * x_data[j]; }
-            d[i] = s;
+        #[cfg(feature = "blas")]
+        {
+            if nout * nin >= 256 {
+                let mut buf = vec![0.0f64; nout * nin];
+                for i in 0..nout {
+                    buf[i * nin..(i + 1) * nin].copy_from_slice(&mat_data[i][..nin]);
+                }
+                unsafe { blas_ffi::dgemv(nout, nin, &buf, x_data, &mut d); }
+            } else {
+                for i in 0..nout {
+                    let mut s = 0.0;
+                    for j in 0..nin { s += mat_data[i][j] * x_data[j]; }
+                    d[i] = s;
+                }
+            }
+        }
+        #[cfg(not(feature = "blas"))]
+        {
+            for i in 0..nout {
+                let mut s = 0.0;
+                for j in 0..nin { s += mat_data[i][j] * x_data[j]; }
+                d[i] = s;
+            }
         }
         let op = if grad_on() { Op::MatVec { mat, x } } else { Op::Leaf };
         self.push(d, op, vec![])
@@ -620,6 +663,17 @@ impl MatrixParam {
 
     fn matvec_raw(&self, x: &[f64]) -> Vec<f64> {
         let mut out = vec![0.0; self.nout];
+        #[cfg(feature = "blas")]
+        {
+            if self.nout * self.nin >= 256 {
+                let mut buf = vec![0.0f64; self.nout * self.nin];
+                for i in 0..self.nout {
+                    buf[i * self.nin..(i + 1) * self.nin].copy_from_slice(&self.data[i][..self.nin]);
+                }
+                unsafe { blas_ffi::dgemv(self.nout, self.nin, &buf, x, &mut out); }
+                return out;
+            }
+        }
         for i in 0..self.nout {
             let mut s = 0.0;
             for j in 0..self.nin { s += self.data[i][j] * x[j]; }

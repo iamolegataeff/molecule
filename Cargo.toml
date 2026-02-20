@@ -8,6 +8,10 @@ description = "The Fifth Element: a GPT organism + distributed cognition metabol
 name = "molequla"
 path = "molequla.rs"
 
+[features]
+default = []
+blas = []
+
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

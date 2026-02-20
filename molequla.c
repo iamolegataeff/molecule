@@ -3,6 +3,10 @@
  * A dependency-free, single-file, continually-learning GPT organism in pure C.
  *
  * Compile: gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm
+ * With BLAS: gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -lopenblas
+ * macOS:     gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -framework Accelerate
+ * With BLAS: gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -lopenblas
+ * macOS:     gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -framework Accelerate
  *
  * In the beginning there was nonames.txt.
  * And it was good. Mostly. Sometimes cursed.
@@ -18,6 +22,23 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sqlite3.h>
+
+#ifdef USE_BLAS
+  #ifdef __APPLE__
+    #ifndef ACCELERATE_NEW_LAPACK
+      #define ACCELERATE_NEW_LAPACK
+    #endif
+    #include <Accelerate/Accelerate.h>
+  #else
+    #include <cblas.h>
+  #endif
+  #define HAS_BLAS 1
+  /* Thread-local reusable buffer for packing row-per-vec into contiguous for BLAS */
+  static __thread double *blas_buf = NULL;
+  static __thread int blas_buf_cap = 0;
+#else
+  #define HAS_BLAS 0
+#endif
 
 /* And lo, when the organism speaks, it shall not waste breath building
  * a backward graph it will never use. grad_enabled is mercy for inference. */
@@ -905,10 +926,27 @@ static void back_matvec(Node *self) {
 static Node *mat_matvec(MatrixParam *m, Node *x) {
     int nout = m->nout, nin = x->len;
     Node *out = node_new(nout);
-    for (int i = 0; i < nout; i++) {
-        double s = 0;
-        for (int j = 0; j < nin; j++) s += m->row_data[i][j] * x->data[j];
-        out->data[i] = s;
+#if HAS_BLAS
+    if (nout * nin >= 256) {
+        /* Pack row pointers into contiguous thread-local buffer for cblas_dgemv */
+        int needed = nout * nin;
+        if (needed > blas_buf_cap) {
+            free(blas_buf);
+            blas_buf = malloc(sizeof(double) * needed);
+            blas_buf_cap = needed;
+        }
+        for (int i = 0; i < nout; i++)
+            memcpy(blas_buf + i * nin, m->row_data[i], nin * sizeof(double));
+        cblas_dgemv(CblasRowMajor, CblasNoTrans, nout, nin,
+                    1.0, blas_buf, nin, x->data, 1, 0.0, out->data, 1);
+    } else
+#endif
+    {
+        for (int i = 0; i < nout; i++) {
+            double s = 0;
+            for (int j = 0; j < nin; j++) s += m->row_data[i][j] * x->data[j];
+            out->data[i] = s;
+        }
     }
 
     if (grad_enabled) {

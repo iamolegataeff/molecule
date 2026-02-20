@@ -741,8 +741,8 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 	nin := len(x.Data)
 	outData := make([]float64, nout)
 
-	// BLAS fast path: cblas_dgemv for inference (no autograd needed)
-	if accel.HasAccel && !gradEnabled.Load() && nout*nin >= 256 {
+	// BLAS fast path: cblas_dgemv for both training and inference forward pass
+	if accel.HasAccel && nout*nin >= 256 {
 		needed := nout * nin
 		buf := accelBufPool.Get().([]float64)
 		if cap(buf) < needed {
@@ -755,15 +755,14 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 		}
 		accel.Dgemv(nout, nin, buf, x.Data, outData)
 		accelBufPool.Put(buf[:0])
-		return NewVec(outData)
-	}
-
-	for i := 0; i < nout; i++ {
-		sum := 0.0
-		for j := 0; j < nin; j++ {
-			sum += m.Rows[i].Data[j] * x.Data[j]
+	} else {
+		for i := 0; i < nout; i++ {
+			sum := 0.0
+			for j := 0; j < nin; j++ {
+				sum += m.Rows[i].Data[j] * x.Data[j]
+			}
+			outData[i] = sum
 		}
-		outData[i] = sum
 	}
 
 	out := NewVec(outData)
