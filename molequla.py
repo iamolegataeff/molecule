@@ -3054,6 +3054,11 @@ async def chat_main():
         tok = EvolvingTokenizer(docs if docs else ["Hello."])
         model = GPT(tok)
 
+        # Initialize at the correct stage for corpus size
+        corpus_chars = sum(len(d) for d in docs) if docs else 0
+        while model.maybe_grow_architecture(corpus_chars):
+            model._growth_freeze_remaining = 0  # skip freeze during init
+
     # Ensure tokenizer evolution can expand model
     model.maybe_expand_vocab(tok.vocab_size)
 

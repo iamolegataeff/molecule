@@ -3608,7 +3608,12 @@ async function awaken() {
     } else {
         tok = new EvolvingTokenizer(_corpusLines);
         model = new GPT(tok);
-        logUI(`[init] Fresh model created. vocab=${tok.vocabSize}, embd=${CFG.nEmbd}, layers=${CFG.nLayer}`);
+        // Initialize at the correct stage for corpus size
+        let initCorpusChars = _corpusLines.reduce((a, l) => a + l.length, 0);
+        while (model.maybeGrowArchitecture(initCorpusChars)) {
+            model._growthFreezeRemaining = 0; // skip freeze during init
+        }
+        logUI(`[init] Fresh model created. vocab=${tok.vocabSize}, embd=${model.nEmbd}, layers=${model.nLayer}`);
     }
     model.maybeExpandVocab(tok.vocabSize);
 

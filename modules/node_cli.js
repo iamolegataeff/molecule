@@ -261,7 +261,12 @@ async function main() {
     } else {
         tok = new EvolvingTokenizer(corpusLines);
         model = new GPT(tok);
-        console.log(`[init] Fresh model. vocab=${tok.vocabSize}, embd=${CFG.nEmbd}, layers=${CFG.nLayer}`);
+        // Initialize at the correct stage for corpus size
+        const initChars = corpusLines.reduce((a, l) => a + l.length, 0);
+        while (model.maybeGrowArchitecture(initChars)) {
+            model._growthFreezeRemaining = 0; // skip freeze during init
+        }
+        console.log(`[init] Fresh model. vocab=${tok.vocabSize}, embd=${model.nEmbd}, layers=${model.nLayer}`);
     }
     model.maybeExpandVocab(tok.vocabSize);
 

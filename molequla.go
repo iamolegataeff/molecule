@@ -4997,6 +4997,15 @@ func main() {
 		}
 		tok = NewEvolvingTokenizer(docs)
 		model = NewGPT(tok)
+
+		// Initialize at the correct stage for corpus size (don't start at embryo for large corpus)
+		corpusChars := 0
+		for _, d := range docs {
+			corpusChars += len(d)
+		}
+		for model.MaybeGrowArchitecture(corpusChars) {
+			model.growthFreezeRemaining = 0 // skip freeze during init — no weights to preserve yet
+		}
 	}
 
 	model.MaybeExpandVocab(tok.VocabSize)

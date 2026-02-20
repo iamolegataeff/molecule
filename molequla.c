@@ -4641,6 +4641,15 @@ int main(int argc, char **argv) {
     GPT *model = gpt_new(tok);
     free(doc_ptrs);
 
+    /* Initialize at the correct stage for corpus size */
+    {
+        int corpus_chars = 0;
+        for (int i = 0; i < docs.len; i++) corpus_chars += (int)strlen(docs.items[i]);
+        while (gpt_maybe_grow_architecture(model, corpus_chars)) {
+            model->growth_freeze_remaining = 0; /* skip freeze during init */
+        }
+    }
+
     /* Build corpus field for pre-warmup speech */
     CooccurField *cooccur = cooccur_new(tok->vocab_size);
     cooccur_build(cooccur, tok, &docs);
