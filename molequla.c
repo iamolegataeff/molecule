@@ -4159,64 +4159,78 @@ static void save_checkpoint(GPT *g, EvolvingTokenizer *tok, const char *path) {
 /* Load checkpoint: reverse of save_checkpoint.
  * Returns loaded GPT* on success, NULL on failure.
  * On success, *out_tok is set to the restored tokenizer. */
+#define CKPT_READ(ptr, sz, n, fp) do { if (fread((ptr),(sz),(n),(fp)) != (size_t)(n)) { fprintf(stderr, "[checkpoint] truncated at %s:%d\n", __FILE__, __LINE__); goto ckpt_fail; } } while(0)
+#define CKPT_READ_INT(var, fp) CKPT_READ(&(var), 4, 1, fp)
 static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
+    EvolvingTokenizer *tok = NULL;
+    char **saved_names = NULL;
+    MatrixParam **saved_mats = NULL;
+    int n_base = 0;
+    GPT *g = NULL;
 
     /* Magic + version */
     char magic[4];
     int ver;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MOLE", 4) != 0) { fclose(f); return NULL; }
-    if (fread(&ver, 4, 1, f) != 1 || ver != 1) { fclose(f); return NULL; }
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MOLE", 4) != 0) goto ckpt_fail;
+    if (fread(&ver, 4, 1, f) != 1 || ver != 1) goto ckpt_fail;
 
     /* Tokenizer */
     int vocab_size;
-    fread(&vocab_size, 4, 1, f);
-    EvolvingTokenizer *tok = calloc(1, sizeof(EvolvingTokenizer));
+    CKPT_READ_INT(vocab_size, f);
+    if (vocab_size < 0 || vocab_size > 1000000) goto ckpt_fail;
+    tok = calloc(1, sizeof(EvolvingTokenizer));
     tok->stoi = stoi_new();
     tok->cap = vocab_size + 256;
     tok->tokens = calloc(tok->cap, sizeof(char*));
     tok->vocab_size = vocab_size;
     for (int i = 0; i < vocab_size; i++) {
-        int slen; fread(&slen, 4, 1, f);
+        int slen; CKPT_READ_INT(slen, f);
+        if (slen < 0 || slen > 65536) goto ckpt_fail;
         tok->tokens[i] = calloc(slen + 1, 1);
-        fread(tok->tokens[i], 1, slen, f);
+        CKPT_READ(tok->tokens[i], 1, slen, f);
         stoi_put(tok->stoi, tok->tokens[i], i);
     }
-    fread(&tok->bpe_enabled, 4, 1, f);
-    fread(&tok->n_merges, 4, 1, f);
+    CKPT_READ_INT(tok->bpe_enabled, f);
+    CKPT_READ_INT(tok->n_merges, f);
+    if (tok->n_merges < 0 || tok->n_merges > 1000000) goto ckpt_fail;
     if (tok->n_merges > 0) {
         tok->merges = calloc(tok->n_merges, sizeof(MergePair));
         for (int i = 0; i < tok->n_merges; i++) {
             int la, lb;
-            fread(&la, 4, 1, f);
+            CKPT_READ_INT(la, f);
+            if (la < 0) goto ckpt_fail;
             int la_cap = la > 63 ? 63 : la;
-            fread(tok->merges[i].a, 1, la_cap, f); tok->merges[i].a[la_cap] = 0;
+            CKPT_READ(tok->merges[i].a, 1, la_cap, f); tok->merges[i].a[la_cap] = 0;
             if (la > la_cap) fseek(f, la - la_cap, SEEK_CUR);
-            fread(&lb, 4, 1, f);
+            CKPT_READ_INT(lb, f);
+            if (lb < 0) goto ckpt_fail;
             int lb_cap = lb > 63 ? 63 : lb;
-            fread(tok->merges[i].b, 1, lb_cap, f); tok->merges[i].b[lb_cap] = 0;
+            CKPT_READ(tok->merges[i].b, 1, lb_cap, f); tok->merges[i].b[lb_cap] = 0;
             if (lb > lb_cap) fseek(f, lb - lb_cap, SEEK_CUR);
         }
     }
-    fread(&tok->trained_chars, 4, 1, f);
-    fread(&tok->bos_id, 4, 1, f);
-    fread(&tok->eos_id, 4, 1, f);
-    fread(&tok->pad_id, 4, 1, f);
+    CKPT_READ_INT(tok->trained_chars, f);
+    CKPT_READ_INT(tok->bos_id, f);
+    CKPT_READ_INT(tok->eos_id, f);
+    CKPT_READ_INT(tok->pad_id, f);
 
     /* Read base matrices into temp arrays to determine model shape */
-    int n_base;
-    fread(&n_base, 4, 1, f);
-    char **saved_names = calloc(n_base, sizeof(char*));
-    MatrixParam **saved_mats = calloc(n_base, sizeof(MatrixParam*));
+    CKPT_READ_INT(n_base, f);
+    if (n_base < 0 || n_base > 100000) goto ckpt_fail;
+    saved_names = calloc(n_base, sizeof(char*));
+    saved_mats = calloc(n_base, sizeof(MatrixParam*));
     for (int i = 0; i < n_base; i++) {
-        int nlen; fread(&nlen, 4, 1, f);
+        int nlen; CKPT_READ_INT(nlen, f);
+        if (nlen < 0 || nlen > 256) goto ckpt_fail;
         saved_names[i] = calloc(nlen + 1, 1);
-        fread(saved_names[i], 1, nlen, f);
-        int nout, nin; fread(&nout, 4, 1, f); fread(&nin, 4, 1, f);
+        CKPT_READ(saved_names[i], 1, nlen, f);
+        int nout, nin; CKPT_READ_INT(nout, f); CKPT_READ_INT(nin, f);
+        if (nout <= 0 || nin <= 0 || nout > 100000 || nin > 100000) goto ckpt_fail;
         MatrixParam *m = mat_new(nout, nin, 0.0);
         for (int r = 0; r < nout; r++)
-            fread(m->row_data[r], sizeof(double), nin, f);
+            CKPT_READ(m->row_data[r], sizeof(double), nin, f);
         saved_mats[i] = m;
     }
 
@@ -4244,19 +4258,21 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
 
     /* Read metadata */
     int global_step, last_warmup_stage, growth_step_offset;
-    fread(&global_step, 4, 1, f);
-    fread(&last_warmup_stage, 4, 1, f);
-    fread(&growth_step_offset, 4, 1, f);
+    CKPT_READ_INT(global_step, f);
+    CKPT_READ_INT(last_warmup_stage, f);
+    CKPT_READ_INT(growth_step_offset, f);
 
     /* Read deltas */
     int n_deltas;
-    fread(&n_deltas, 4, 1, f);
+    CKPT_READ_INT(n_deltas, f);
+    if (n_deltas < 0 || n_deltas > MAX_DELTA_MODS * 2) goto ckpt_fail;
     double saved_alpha[MAX_DELTA_MODS];
-    if (n_deltas > MAX_DELTA_MODS) n_deltas = MAX_DELTA_MODS;
-    fread(saved_alpha, sizeof(double), n_deltas, f);
+    int alpha_count = n_deltas > MAX_DELTA_MODS ? MAX_DELTA_MODS : n_deltas;
+    CKPT_READ(saved_alpha, sizeof(double), alpha_count, f);
+    if (n_deltas > MAX_DELTA_MODS) fseek(f, sizeof(double) * (n_deltas - MAX_DELTA_MODS), SEEK_CUR);
 
     /* Create model with checkpoint dimensions */
-    GPT *g = gpt_new(tok);
+    g = gpt_new(tok);
     g->global_step = global_step;
     g->last_warmup_stage = last_warmup_stage;
     g->growth_step_offset = growth_step_offset;
@@ -4268,7 +4284,6 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
             for (int r = 0; r < dst->nout; r++)
                 memcpy(dst->row_data[r], saved_mats[i]->row_data[r], sizeof(double) * dst->nin);
         }
-        /* Free saved matrix */
         for (int r = 0; r < saved_mats[i]->nout; r++) {
             free(saved_mats[i]->row_data[r]);
             free(saved_mats[i]->row_grad[r]);
@@ -4278,45 +4293,46 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
         free(saved_mats[i]);
         free(saved_names[i]);
     }
-    free(saved_names);
-    free(saved_mats);
+    free(saved_names); saved_names = NULL;
+    free(saved_mats); saved_mats = NULL;
 
-    /* Load delta modules (replacing the default one) */
-    for (int d = 0; d < n_deltas && d < g->n_deltas; d++) {
+    /* Load delta modules */
+    for (int d = 0; d < alpha_count && d < g->n_deltas; d++) {
         g->active_alpha[d] = saved_alpha[d];
     }
     /* Read saved delta adapter weights */
     for (int d = 0; d < n_deltas; d++) {
-        int count; fread(&count, 4, 1, f);
+        int count; CKPT_READ_INT(count, f);
+        if (count < 0 || count > 10000) goto ckpt_fail;
         if (d >= g->n_deltas) {
-            /* Skip unknown delta modules */
             for (int a = 0; a < count; a++) {
-                int nlen; fread(&nlen, 4, 1, f); fseek(f, nlen, SEEK_CUR);
-                int ao, ai; fread(&ao, 4, 1, f); fread(&ai, 4, 1, f);
+                int nlen; CKPT_READ_INT(nlen, f); if (nlen < 0) goto ckpt_fail;
+                fseek(f, nlen, SEEK_CUR);
+                int ao, ai; CKPT_READ_INT(ao, f); CKPT_READ_INT(ai, f);
                 fseek(f, sizeof(double) * ao * ai, SEEK_CUR);
-                int bo, bi; fread(&bo, 4, 1, f); fread(&bi, 4, 1, f);
+                int bo, bi; CKPT_READ_INT(bo, f); CKPT_READ_INT(bi, f);
                 fseek(f, sizeof(double) * bo * bi, SEEK_CUR);
             }
             continue;
         }
         DeltaModule *mod = g->deltas[d];
         for (int a = 0; a < count; a++) {
-            int nlen; fread(&nlen, 4, 1, f);
+            int nlen; CKPT_READ_INT(nlen, f);
+            if (nlen < 0) goto ckpt_fail;
             int nlen_cap = nlen > 127 ? 127 : nlen;
             char aname[128];
-            fread(aname, 1, nlen_cap, f); aname[nlen_cap] = 0;
+            CKPT_READ(aname, 1, nlen_cap, f); aname[nlen_cap] = 0;
             if (nlen > nlen_cap) fseek(f, nlen - nlen_cap, SEEK_CUR);
-            /* Format: A_nout, A_nin, A_data, B_nout, B_nin, B_data */
-            int ao, ai; fread(&ao, 4, 1, f); fread(&ai, 4, 1, f);
+            int ao, ai; CKPT_READ_INT(ao, f); CKPT_READ_INT(ai, f);
             DeltaAdapter *da = dmod_get(mod, aname);
             if (da && da->A->nout == ao && da->A->nin == ai) {
-                for (int r = 0; r < ao; r++) fread(da->A->row_data[r], sizeof(double), ai, f);
+                for (int r = 0; r < ao; r++) CKPT_READ(da->A->row_data[r], sizeof(double), ai, f);
             } else {
                 fseek(f, sizeof(double) * ao * ai, SEEK_CUR);
             }
-            int bo, bi; fread(&bo, 4, 1, f); fread(&bi, 4, 1, f);
+            int bo, bi; CKPT_READ_INT(bo, f); CKPT_READ_INT(bi, f);
             if (da && da->B->nout == bo && da->B->nin == bi) {
-                for (int r = 0; r < bo; r++) fread(da->B->row_data[r], sizeof(double), bi, f);
+                for (int r = 0; r < bo; r++) CKPT_READ(da->B->row_data[r], sizeof(double), bi, f);
             } else {
                 fseek(f, sizeof(double) * bo * bi, SEEK_CUR);
             }
@@ -4324,16 +4340,44 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
     }
 
     fclose(f);
-
-    /* Re-snapshot init embeddings (checkpoint has trained weights, not init) */
-    /* Keep the gamma snapshot from the fresh gpt_new — it's already zeroed embeddings.
-     * Actually, we should re-snapshot from the loaded weights if this is a fresh load. */
-
     *out_tok = tok;
     printf("[checkpoint] Loaded from %s: step=%d, embd=%d, layers=%d, heads=%d\n",
            path, global_step, n_embd, CFG.n_layer, n_head);
     return g;
+
+ckpt_fail:
+    fprintf(stderr, "[checkpoint] Failed to load %s\n", path);
+    if (f) fclose(f);
+    /* Free partially-loaded saved matrices */
+    if (saved_names && saved_mats) {
+        for (int i = 0; i < n_base; i++) {
+            if (saved_mats[i]) {
+                for (int r = 0; r < saved_mats[i]->nout; r++) {
+                    free(saved_mats[i]->row_data[r]);
+                    free(saved_mats[i]->row_grad[r]);
+                }
+                free(saved_mats[i]->row_data);
+                free(saved_mats[i]->row_grad);
+                free(saved_mats[i]);
+            }
+            free(saved_names[i]);
+        }
+        free(saved_names);
+        free(saved_mats);
+    }
+    /* Don't free tok here — caller expects NULL return means no tok allocated,
+     * but we allocated tok early. Free it if model creation failed. */
+    if (tok && !g) {
+        for (int i = 0; i < tok->vocab_size; i++) free(tok->tokens[i]);
+        free(tok->tokens);
+        free(tok->merges);
+        free(tok);
+    }
+    if (g) { /* model was created but delta loading failed — still usable */ }
+    return NULL;
 }
+#undef CKPT_READ
+#undef CKPT_READ_INT
 
 /* ============================================================
  * 11) CHAT LOOP + MAIN

@@ -2673,6 +2673,8 @@ def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True
         _train_steps_locked(model, tok, docs, steps, train_base, train_deltas)
 
 def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
+    if not docs:
+        return
     # Ontogenesis freeze: after growth, only train deltas until new weights stabilize
     if model._growth_freeze_remaining > 0:
         base_params = []

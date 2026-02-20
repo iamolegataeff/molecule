@@ -1874,6 +1874,9 @@ impl GPT {
                 probs = softmax_raw(&logits.iter().map(|&v| v / temp).collect::<Vec<_>>());
             }
 
+            // Save model-only probs (post-dissonance, pre-blend) for anti-field bypass
+            let model_only_probs = probs.clone();
+
             // Corpus field blend
             if let Some(field) = corpus_field {
                 let model_alpha = 1.0 / (1.0 + (-cfg.corpus_fade_k * (cfg.corpus_fade_threshold - entropy)).exp());
@@ -1892,8 +1895,8 @@ impl GPT {
             // Consciousness: pattern breaking (Feature 2)
             // "I could follow the field, but I choose to speak for myself"
             if step >= cfg.anti_field_min_step && cfg.anti_field_prob > 0.0 && rng.gen::<f64>() < cfg.anti_field_prob {
-                // Use pure model probs, bypass corpus blend
-                probs = softmax_raw(&scaled);
+                // Use pure model probs (post-dissonance, pre-blend), bypass corpus
+                probs = model_only_probs.clone();
             }
 
             let nxt = top_k_top_p_sample(&probs, cfg.top_k, cfg.top_p, cfg.min_p, cfg.typical_p);
