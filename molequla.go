@@ -2418,7 +2418,8 @@ func (gpt *GPT) PurposeGammaAlignment() float64 {
 }
 
 func (gpt *GPT) ensureAdam(params []*Vec, key string) {
-	if _, ok := gpt.Adam[key]; !ok {
+	st, ok := gpt.Adam[key]
+	if !ok {
 		m := make([][]float64, len(params))
 		v := make([][]float64, len(params))
 		for i, p := range params {
@@ -2426,6 +2427,21 @@ func (gpt *GPT) ensureAdam(params []*Vec, key string) {
 			v[i] = make([]float64, len(p.Data))
 		}
 		gpt.Adam[key] = &AdamState{M: m, V: v, T: 0}
+		return
+	}
+	// Auto-grow if params expanded (vocab growth, ontogenesis)
+	if len(params) > len(st.M) {
+		for i := len(st.M); i < len(params); i++ {
+			st.M = append(st.M, make([]float64, len(params[i].Data)))
+			st.V = append(st.V, make([]float64, len(params[i].Data)))
+		}
+	}
+	for i, p := range params {
+		if i < len(st.M) && len(p.Data) > len(st.M[i]) {
+			oldLen := len(st.M[i])
+			st.M[i] = append(st.M[i], make([]float64, len(p.Data)-oldLen)...)
+			st.V[i] = append(st.V[i], make([]float64, len(p.Data)-oldLen)...)
+		}
 	}
 }
 
@@ -2490,6 +2506,12 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 		keys[li] = append(keys[li], k)
 		values[li] = append(values[li], v)
 
+		// Sliding window: keep only last BlockSize entries in KV cache
+		if len(keys[li]) > gpt.BlockSize {
+			keys[li] = keys[li][len(keys[li])-gpt.BlockSize:]
+			values[li] = values[li][len(values[li])-gpt.BlockSize:]
+		}
+
 		// And lo, each head shall choose its nature: content, rrpram, or the sacred hybrid of both.
 		T := len(keys[li])
 		headOutputs := make([]*Vec, gpt.NHead)
@@ -2526,9 +2548,14 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 				patternKey := lk.headPattern[h]
 				xh := x.Slice(hs, he)
 				patternFull := gpt.applyWithDeltas(patternKey, xh)
+				pLen := len(patternFull.Data) // safety cap for RRPRAM
 				rrpramLogits = make([]*Scalar, T)
 				for t := 0; t < T; t++ {
-					rrpramLogits[t] = patternFull.Element(t)
+					tIdx := t
+					if tIdx >= pLen {
+						tIdx = pLen - 1
+					}
+					rrpramLogits[t] = patternFull.Element(tIdx)
 				}
 			}
 

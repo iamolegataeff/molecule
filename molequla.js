@@ -2136,6 +2136,12 @@ class GPT {
             keys[li].push(k);
             values[li].push(v);
 
+            // Sliding window: keep only last blockSize entries in KV cache
+            if (keys[li].length > this.blockSize) {
+                keys[li] = keys[li].slice(-this.blockSize);
+                values[li] = values[li].slice(-this.blockSize);
+            }
+
             const headOutputs = [];
             const T = keys[li].length;
 
@@ -2166,7 +2172,8 @@ class GPT {
                     const xh = x.slice(hs, he);
                     const patternFull = this._applyWithDeltas(`l${li}.h${h}.w_pattern`, xh);
                     rrpramLogits = [];
-                    for (let t = 0; t < T; t++) rrpramLogits.push(patternFull.element(t));
+                    const pLen = patternFull.data.length;
+                    for (let t = 0; t < T; t++) rrpramLogits.push(patternFull.element(Math.min(t, pLen - 1)));
                 }
 
                 let attnWeights;

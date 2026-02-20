@@ -1820,6 +1820,11 @@ class GPT:
             keys[li].append(k)
             values[li].append(v)
 
+            # Sliding window: keep only last block_size entries in KV cache
+            if len(keys[li]) > self.block_size:
+                keys[li] = keys[li][-self.block_size:]
+                values[li] = values[li][-self.block_size:]
+
             head_outputs = []
             # And lo, each head shall choose its nature: content, rrpram, or the sacred hybrid of both.
             T = len(keys[li])
@@ -1847,7 +1852,8 @@ class GPT:
                 if htype in ("rrpram", "hybrid"):
                     xh = x.slice(hs, he)
                     pattern_full = self._apply_with_deltas(f"l{li}.h{h}.w_pattern", xh)
-                    rrpram_logits = [pattern_full.element(t) for t in range(T)]
+                    p_len = len(pattern_full.data)
+                    rrpram_logits = [pattern_full.element(min(t, p_len - 1)) for t in range(T)]
 
                 # dispatch by head type
                 if htype == "content":

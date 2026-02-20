@@ -2353,9 +2353,12 @@ static Node *gpt_forward_step(GPT *g, int token_id, int pos_id, KVCache *kv) {
                 snprintf(pname, sizeof(pname), "l%d.h%d.w_pattern", li, h);
                 Node *xh = vec_slice(x, hs, he);
                 Node *pattern_full = gpt_apply(g, pname, xh);
+                int p_len = pattern_full->len;
                 rrpram_logits = arena_alloc(&G_arena, sizeof(Node*) * T);
-                for (int t = 0; t < T; t++)
-                    rrpram_logits[t] = vec_element(pattern_full, t);
+                for (int t = 0; t < T; t++) {
+                    int t_idx = t < p_len ? t : p_len - 1;
+                    rrpram_logits[t] = vec_element(pattern_full, t_idx);
+                }
             }
 
             /* Dispatch by head type */
