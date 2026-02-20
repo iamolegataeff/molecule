@@ -1772,7 +1772,7 @@ fn train_steps(model: &mut GPT, docs: &[String], steps: usize, train_base: bool,
 
         let mut lr = cosine_lr(model.global_step, &cfg);
         // Scale LR inversely with model size: larger models need smaller LR
-        lr *= (cfg.growth_stages[0][1] as f64 / model.n_embd as f64).sqrt();
+        lr *= cfg.growth_stages[0][1] as f64 / model.n_embd as f64;
         // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
         if model.growth_freeze_remaining > 0 { lr *= cfg.post_growth_lr_scale; }
         model.global_step += 1;

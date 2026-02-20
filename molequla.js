@@ -2801,7 +2801,7 @@ function trainSteps(model, tok, docs, steps, trainBase, trainDeltas) {
 
         let lr = cosineLR(model.globalStep);
         // Scale LR inversely with model size: larger models need smaller LR
-        lr *= Math.sqrt(CFG.growthStages[0][1] / model.nEmbd);
+        lr *= CFG.growthStages[0][1] / model.nEmbd;
         // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
         if (model._growthFreezeRemaining > 0) lr *= CFG.postGrowthLRScale;
         if (baseParams.length) model.adamStep(baseParams, "base", lr);

@@ -2650,7 +2650,7 @@ def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
 
         lr = cosine_lr(model.global_step)
         # Scale LR inversely with model size: larger models need smaller LR
-        lr *= math.sqrt(CFG.growth_stages[0][1] / model.n_embd)
+        lr *= CFG.growth_stages[0][1] / model.n_embd
         # Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
         if model._growth_freeze_remaining > 0:
             lr *= CFG.post_growth_lr_scale

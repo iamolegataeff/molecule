@@ -4689,7 +4689,7 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 
 		lr := cosineLR(model.globalStep)
 		// Scale LR inversely with model size: larger models need smaller LR
-		lr *= math.Sqrt(float64(CFG.GrowthStages[0][1]) / float64(model.NEmbd))
+		lr *= float64(CFG.GrowthStages[0][1]) / float64(model.NEmbd)
 		// Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
 		if model.growthFreezeRemaining > 0 {
 			lr *= CFG.PostGrowthLRScale

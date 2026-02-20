@@ -204,7 +204,7 @@ function nodeTrainSteps(model, tok, docs, nSteps, logEvery) {
 
         let lr = cosineLR(model.globalStep || 0);
         // Scale LR inversely with model size: larger models need smaller LR
-        lr *= Math.sqrt((CFG.growthStages || [[0,16]])[0][1] / (model.nEmbd || 16));
+        lr *= (CFG.growthStages || [[0,16]])[0][1] / (model.nEmbd || 16);
         // Post-growth LR dampening
         if (model._growthFreezeRemaining > 0) lr *= (CFG.postGrowthLRScale || 0.3);
         if (baseParams.length) model.adamStep(baseParams, "base", lr);

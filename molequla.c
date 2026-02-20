@@ -3982,7 +3982,7 @@ static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
 
         double lr = cosine_lr(g->global_step);
         /* Scale LR inversely with model size: larger models need smaller LR */
-        lr *= sqrt((double)CFG.growth_stages[0][1] / (double)g->n_embd);
+        lr *= (double)CFG.growth_stages[0][1] / (double)g->n_embd;
 
         /* Ontogenesis freeze: after growth, base params are excluded,
          * only deltas train until new weights stabilize. */
