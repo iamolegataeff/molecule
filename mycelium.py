@@ -37,6 +37,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
+try:
+    import aiosqlite
+except ImportError:
+    aiosqlite = None
+
 from ariannamethod import Method
 
 
@@ -812,6 +817,7 @@ class Mycelium:
 
     def __init__(self, mesh_path="mesh.db", interval=1.0, verbose=True):
         self.method = Method(mesh_path)
+        self.mesh_path = mesh_path
         self.interval = interval
         self.verbose = verbose
         self.monitor = FieldMonitor()
@@ -826,6 +832,9 @@ class Mycelium:
         self.running = False
         self._step_count = 0
         self._last_steering = None
+        # SACRED: field lock. Only ONE step at a time.
+        # Sequential field evolution = coherence. (from leo async architecture)
+        self._field_lock = asyncio.Lock()
 
     def step(self):
         """one tick: snapshot → METHOD → harmonic → gamma → syntropy → steer."""
@@ -936,6 +945,194 @@ class Mycelium:
                 print(drift_report)
 
         return steering
+
+    async def async_step(self):
+        """async one tick: snapshot → METHOD → harmonic → gamma → syntropy → steer.
+        Uses asyncio.Lock for field coherence (from leo async architecture).
+        Uses aiosqlite for non-blocking SQLite I/O.
+        C computation stays sync (0.7μs — not worth async overhead)."""
+        async with self._field_lock:
+            # 1. Snapshot field state BEFORE decision
+            self.method.read_field()  # sync C calls (fast)
+            pre_h = self.method.field_entropy()
+            pre_s = self.method.field_syntropy()
+            pre_c = self.method.field_coherence()
+            self.syntropy.snapshot_before(pre_h, pre_s, pre_c)
+
+            # 2. METHOD computes raw steering (C-native, BLAS) — sync, fast
+            steering = self.method.step(dt=self.interval)
+
+            # 2b. Measure field pulse
+            self.pulse.measure(self.method.organisms, pre_h)
+            pre_entropies = {o.id: o.entropy for o in self.method.organisms}
+
+            # 3. HarmonicNet refines
+            h_out = self.harmonic.forward(
+                self.method.organisms,
+                steering.get("entropy", 0),
+                steering.get("coherence", 1),
+                steering.get("syntropy", 0),
+                self._step_count,
+            )
+            if h_out["strength_mod"] > 0:
+                steering["strength"] = steering.get("strength", 0.5) * h_out["strength_mod"]
+
+            if h_out["action_bias"]:
+                best_harmonic = max(h_out["action_bias"], key=h_out["action_bias"].get)
+                steering["harmonic_suggestion"] = best_harmonic
+                steering["harmonic_confidence"] = h_out["action_bias"][best_harmonic]
+
+            # 3b. Dissonance modulation
+            post_h = steering.get("entropy", pre_h)
+            post_s = steering.get("syntropy", pre_s)
+            post_c = steering.get("coherence", pre_c)
+            action = steering.get("action", "wait")
+            dis = self.dissonance.update(action, post_h - pre_h, post_c - pre_c)
+            steering["strength"] = min(1.0,
+                steering.get("strength", 0.5) * self.dissonance.strength_multiplier())
+
+            # 4. Write steering to mesh.db — ASYNC
+            await self._async_write_steering(steering)
+
+            # 4b. Organism attention
+            self.attention.update(self.method.organisms, action=action,
+                                  pre_entropies=pre_entropies)
+
+            # 5. Record decision in syntropy tracker
+            strength = steering.get("strength", 0)
+            self.syntropy.record_decision(action, strength, post_h, post_s, post_c)
+
+            # 6. Imprint on gamma
+            self.gamma.imprint(action, strength, post_h - pre_h)
+
+            # 7. Monitor + bookkeeping
+            self.monitor.record(steering)
+            self._step_count += 1
+            self._last_steering = steering
+
+            # Self-awareness metadata
+            steering["gamma_magnitude"] = self.gamma.magnitude
+            tendency, tendency_cos = self.gamma.dominant_tendency()
+            steering["gamma_tendency"] = tendency
+            steering["syntropy_trend"] = self.syntropy.syntropy_trend
+            steering["decision_entropy"] = self.syntropy.decision_entropy
+            steering["dissonance"] = self.dissonance.dissonance
+            steering["pulse_novelty"] = self.pulse.novelty
+            steering["pulse_arousal"] = self.pulse.arousal
+
+            should_change, reason = self.syntropy.should_change_strategy()
+            if should_change:
+                steering["strategy_warning"] = reason
+
+            # Drifters
+            drift_report = None
+            if self._step_count % 4 == 0:
+                self.drift.update(self.method)
+                drift_report = self.drift.report()
+
+            if self.verbose:
+                status = self.monitor.status_line(steering)
+                if self.gamma.magnitude > 0.01:
+                    status += f" γ={self.gamma.magnitude:.2f}({tendency})"
+                p = self.pulse
+                if p.arousal > 0.01 or p.novelty > 0.01:
+                    status += f" pulse(n={p.novelty:.1f},a={p.arousal:.1f},e={p.entropy:.1f})"
+                if self.dissonance.dissonance > 0.01:
+                    status += f" d={self.dissonance.dissonance:.2f}"
+                if self.syntropy.syntropy_trend != 0:
+                    status += f" Σ={self.syntropy.syntropy_trend:+.3f}"
+                if should_change:
+                    status += f"  ⚠ {reason}"
+                print(status)
+                if drift_report:
+                    print(drift_report)
+
+            return steering
+
+    async def _async_write_steering(self, steering):
+        """write steering to mesh.db using aiosqlite (non-blocking)."""
+        if aiosqlite is None:
+            # Fallback to sync
+            self.method.write_steering(steering)
+            return
+        try:
+            async with aiosqlite.connect(self.mesh_path) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("""
+                    INSERT OR REPLACE INTO field_steering
+                    (id, action, strength, target_id, entropy, syntropy,
+                     coherence, trend, n_organisms, updated_at)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    steering.get("action", "wait"),
+                    steering.get("strength", 0.0),
+                    str(steering.get("target", "")),
+                    steering.get("entropy", 0.0),
+                    steering.get("syntropy", 0.0),
+                    steering.get("coherence", 0.0),
+                    steering.get("trend", 0.0),
+                    steering.get("n_organisms", 0),
+                    time.time(),
+                ))
+                await db.commit()
+        except Exception as e:
+            # Fallback to sync on error
+            self.method.write_steering(steering)
+
+    async def async_read_field(self):
+        """read organisms from mesh.db using aiosqlite, push to C METHOD."""
+        if aiosqlite is None:
+            self.method.read_field()
+            return self.method.organisms
+        try:
+            async with aiosqlite.connect(self.mesh_path) as db:
+                async with db.execute("""
+                    SELECT id, pid, stage, n_params, syntropy, entropy,
+                           gamma_direction, gamma_magnitude, last_heartbeat
+                    FROM organisms
+                    WHERE status = 'alive' AND last_heartbeat > ?
+                """, (time.time() - 120,)) as cursor:
+                    rows = await cursor.fetchall()
+            # Parse organisms (sync — fast)
+            from ariannamethod.method import Organism
+            self.method.organisms = [Organism(row) for row in rows]
+            # Push to C (sync — 0.7μs)
+            if self.method.lib is not None:
+                import ctypes
+                self.method.lib.am_method_clear()
+                gammas = {}
+                for o in self.method.organisms:
+                    if o.gamma_direction and len(o.gamma_direction) > 0:
+                        try:
+                            arr = np.frombuffer(o.gamma_direction, dtype=np.float64)
+                            norm = np.linalg.norm(arr)
+                            if norm > 1e-12:
+                                gammas[o.id] = arr / norm
+                        except Exception:
+                            pass
+                if len(gammas) >= 2:
+                    vecs = list(gammas.values())
+                    min_len = min(len(v) for v in vecs)
+                    mean_gamma = np.mean([v[:min_len] for v in vecs], axis=0)
+                    mean_norm = np.linalg.norm(mean_gamma)
+                    mean_gamma = mean_gamma / mean_norm if mean_norm > 1e-12 else None
+                else:
+                    mean_gamma = None
+                for o in self.method.organisms:
+                    gamma_mag, gamma_cos = 0.0, 0.0
+                    if o.id in gammas:
+                        g = gammas[o.id]
+                        gamma_mag = float(np.linalg.norm(g))
+                        if mean_gamma is not None:
+                            ml = min(len(g), len(mean_gamma))
+                            gamma_cos = float(np.dot(g[:ml], mean_gamma[:ml]))
+                    oid = hash(o.id) & 0x7FFFFFFF if isinstance(o.id, str) else int(o.id)
+                    self.method.lib.am_method_push_organism(
+                        oid, ctypes.c_float(o.entropy), ctypes.c_float(o.syntropy),
+                        ctypes.c_float(gamma_mag), ctypes.c_float(gamma_cos))
+        except Exception:
+            self.method.read_field()
+        return self.method.organisms
 
     def speak(self):
         """field report in mycelium's voice."""
@@ -1117,17 +1314,18 @@ class Mycelium:
     # ── daemon mode ──
 
     async def run_daemon(self):
-        """background loop: step every interval, no REPL."""
+        """async background loop: async_step every interval, no REPL."""
         self.running = True
         lib_status = "C+BLAS" if self.method.lib else "Python fallback"
-        print(f"[mycelium] daemon started. METHOD engine: {lib_status}")
+        async_status = "aiosqlite" if aiosqlite else "sync fallback"
+        print(f"[mycelium] daemon started. METHOD: {lib_status}. I/O: {async_status}")
         print(f"[mycelium] mesh: {self.method.mesh_path}")
         print(f"[mycelium] interval: {self.interval}s")
         print()
 
         while self.running:
             try:
-                self.step()
+                await self.async_step()
             except KeyboardInterrupt:
                 break
             except Exception as e:
@@ -1139,6 +1337,15 @@ class Mycelium:
 
     def stop(self):
         self.running = False
+
+    async def _bg_async_stepper(self):
+        """background async stepper for REPL mode."""
+        while self.running:
+            try:
+                await self.async_step()
+            except Exception:
+                pass
+            await asyncio.sleep(self.interval)
 
     # ── REPL ──
 
@@ -1153,61 +1360,15 @@ class Mycelium:
             n,
         ))
 
-        # Background stepper thread
+        # Background stepper — async task in event loop
         self.running = True
-        def bg_step():
-            while self.running:
-                try:
-                    self.method.read_field()
-                    if self.method.organisms:
-                        # Snapshot before
-                        pre_h = self.method.field_entropy()
-                        pre_s = self.method.field_syntropy()
-                        pre_c = self.method.field_coherence()
-                        self.syntropy.snapshot_before(pre_h, pre_s, pre_c)
+        self._bg_loop = asyncio.new_event_loop()
 
-                        steering = self.method.step(dt=self.interval)
+        def _run_bg_loop():
+            asyncio.set_event_loop(self._bg_loop)
+            self._bg_loop.run_until_complete(self._bg_async_stepper())
 
-                        # Pulse + pre-entropies
-                        self.pulse.measure(self.method.organisms, pre_h)
-                        pre_entropies = {o.id: o.entropy for o in self.method.organisms}
-
-                        # Harmonic refinement
-                        h_out = self.harmonic.forward(
-                            self.method.organisms,
-                            steering.get("entropy", 0),
-                            steering.get("coherence", 1),
-                            steering.get("syntropy", 0),
-                            self._step_count,
-                        )
-                        if h_out["strength_mod"] > 0:
-                            steering["strength"] = steering.get("strength", 0.5) * h_out["strength_mod"]
-
-                        # Dissonance modulation
-                        action = steering.get("action", "wait")
-                        post_h = steering.get("entropy", pre_h)
-                        post_c = steering.get("coherence", pre_c)
-                        self.dissonance.update(action, post_h - pre_h, post_c - pre_c)
-                        steering["strength"] = min(1.0,
-                            steering.get("strength", 0.5) * self.dissonance.strength_multiplier())
-
-                        self.method.write_steering(steering)
-
-                        # Attention + record + imprint
-                        self.attention.update(self.method.organisms, action, pre_entropies)
-                        strength = steering.get("strength", 0)
-                        self.syntropy.record_decision(action, strength, post_h,
-                            steering.get("syntropy", pre_s), steering.get("coherence", pre_c))
-                        self.gamma.imprint(action, strength, post_h - pre_h)
-
-                        self.monitor.record(steering)
-                        self._last_steering = steering
-                        self._step_count += 1
-                except Exception:
-                    pass
-                time.sleep(self.interval)
-
-        bg = threading.Thread(target=bg_step, daemon=True)
+        bg = threading.Thread(target=_run_bg_loop, daemon=True)
         bg.start()
 
         try:

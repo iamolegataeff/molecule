@@ -3209,7 +3209,7 @@ fn topology_monitor_thread(
     model: Arc<Mutex<GPT>>,
     stop: Arc<AtomicBool>,
 ) {
-    let check_interval = std::time::Duration::from_secs(30);
+    let check_interval = std::time::Duration::from_secs(5);
     let mut topo = TopologyMonitor::new();
 
     // Open our own read-only connection to mesh.db
@@ -3384,7 +3384,7 @@ fn main() {
         let oid = organism_id.clone();
         thread::spawn(move || topology_monitor_thread(mesh_path, oid, m, st))
     };
-    eprintln!("[topology] Monitor thread started (30s interval)");
+    eprintln!("[topology] Monitor thread started (5s interval)");
 
     // Metabolism
     let mut metabolism = Metabolism::new(0);
