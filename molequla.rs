@@ -3151,6 +3151,10 @@ fn main() {
         GPT::new(tok, &cfg)
     };
 
+    // Build corpus field before init — sigmoid fade weakens it as model learns
+    let mut init_corpus_field = CooccurField::new();
+    init_corpus_field.build(&model.tok, &docs);
+
     // Per-stage warmup: grow model to match corpus size, warming up at each stage
     let corpus_chars: usize = docs.iter().map(|d| d.len()).sum();
     let target_stage = model.target_growth_stage(corpus_chars);
@@ -3171,18 +3175,16 @@ fn main() {
             save_checkpoint(&model, &cfg.ckpt_path).ok();
             if !model.maybe_grow_architecture(corpus_chars) { break; }
             model.growth_freeze_remaining = 0; // skip freeze during init growth
+            // Rebuild corpus field after growth (vocab may have expanded)
+            init_corpus_field.build(&model.tok, &docs);
         }
         eprintln!("[init] Per-stage warmup complete. Stage={}", model.current_growth_stage());
     }
 
     let model = Arc::new(Mutex::new(model));
 
-    // Build corpus field
-    let mut corpus_field = CooccurField::new();
-    {
-        let m = model.lock().unwrap();
-        corpus_field.build(&m.tok, &docs);
-    }
+    // Use the init corpus field (already built)
+    let corpus_field = init_corpus_field;
 
     // Swarm
     let organism_id = format!("rust-{}", std::process::id());

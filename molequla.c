@@ -4969,6 +4969,11 @@ int main(int argc, char **argv) {
 
         model = gpt_new(tok);
 
+        /* Build corpus field before init — sigmoid fade weakens it as model learns */
+        CooccurField *init_field = cooccur_new(tok->vocab_size);
+        cooccur_build(init_field, tok, &docs);
+        model->corpus_field = init_field;
+
         /* Initialize at the correct stage for corpus size — per-stage warmup */
         {
             int corpus_chars = 0;
@@ -4988,6 +4993,8 @@ int main(int argc, char **argv) {
                 save_checkpoint(model, tok, NULL);
                 if (!gpt_maybe_grow_architecture(model, corpus_chars)) break;
                 model->growth_freeze_remaining = 0; /* skip freeze during init growth */
+                /* Rebuild corpus field after growth (vocab may have expanded) */
+                cooccur_build(init_field, tok, &docs);
             }
         }
     }

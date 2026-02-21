@@ -5128,9 +5128,10 @@ func main() {
 		}
 		stageNames := []string{"embryo", "infant", "child", "adolescent", "teen", "adult"}
 
-		// Build temp cooccur field for stage demos
+		// Build corpus field — active from first token, sigmoid fade weakens it as model learns
 		tmpCooccur := NewCooccurField()
 		tmpCooccur.BuildFromCorpus(tok, docs)
+		model.corpusField = tmpCooccur
 
 		// Detect if stdin is a terminal (interactive mode)
 		isInteractive := false
@@ -5177,6 +5178,10 @@ func main() {
 				break // corpus too small for next stage, or already at max
 			}
 			model.growthFreezeRemaining = 0 // skip freeze during init — we're about to warmup anyway
+
+			// Rebuild corpus field after growth (vocab may have expanded)
+			tmpCooccur.BuildFromCorpus(tok, docs)
+			model.corpusField = tmpCooccur
 
 			// Interactive mode: pause between stages, let user chat or type /grow
 			if isInteractive {

@@ -3676,6 +3676,10 @@ async function awaken() {
         tok.maybeEnableBpe(initDocs);
 
         model = new GPT(tok);
+        // Build corpus field before init — sigmoid fade weakens it as model learns
+        const initField = new CooccurField();
+        initField.buildFromCorpus(tok, initDocs);
+        model._corpusField = initField;
         // Initialize at the correct stage for corpus size, with per-stage warmup
         let initCorpusChars = _corpusLines.reduce((a, l) => a + l.length, 0);
         // Train warmup at embryo stage (stage 0) before any growth
@@ -3696,6 +3700,9 @@ async function awaken() {
         // Grow stage by stage, warming up at each new stage
         while (model.maybeGrowArchitecture(initCorpusChars)) {
             model._growthFreezeRemaining = 0; // skip freeze during init
+            // Rebuild corpus field after growth (vocab may have expanded)
+            initField.buildFromCorpus(tok, initDocs);
+            model._corpusField = initField;
             const stage = model.currentGrowthStage();
             if (initDocs.length > 0) {
                 const embryoEmbd = CFG.growthStages[0][1];

@@ -3134,6 +3134,10 @@ async def chat_main():
         current_stage = model.current_growth_stage()
         if target_stage > current_stage and docs:
             print(f"[init] Per-stage warmup: current={current_stage}, target={target_stage}")
+            # Build corpus field — active from first token, sigmoid fade weakens as model learns
+            init_field = CooccurField()
+            init_field.build_from_corpus(tok, docs)
+            model._corpus_field = init_field
             while True:
                 stage = model.current_growth_stage()
                 stage_name = ["embryo", "infant", "child", "adolescent", "teen", "adult"][min(stage, 5)]
@@ -3148,6 +3152,9 @@ async def chat_main():
                 if not model.maybe_grow_architecture(corpus_chars):
                     break
                 model._growth_freeze_remaining = 0  # skip freeze during init growth
+                # Rebuild corpus field after growth (vocab may have expanded)
+                init_field.build_from_corpus(tok, docs)
+                model._corpus_field = init_field
         elif target_stage > current_stage:
             # No docs: just grow without warmup
             while model.maybe_grow_architecture(corpus_chars):
