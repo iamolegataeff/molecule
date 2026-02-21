@@ -44,6 +44,7 @@ THIS IS:
 - Mycelium: Python orchestrator that reads the field and steers generation
 - METHOD: C-native field operator (25.8x faster than Python, BLAS-accelerated)
 - Steering chain: mycelium → METHOD → mesh.db → Rust modulates temperature
+- Mycelium self-awareness: γ_myc, HarmonicNet, SyntropyTracker, pulse/dissonance
 - ariannamethod/: AML C core with notorch (Hebbian plasticity, cblas_sger)
 - Entropy-adaptive temperature (no more max-prob hacks)
 - Growth table: SQLite/IndexedDB structural autobiography
@@ -582,6 +583,22 @@ mycelium> /who
   c-beta: stage=5 entropy=0.90 syntropy=0.55 params=150000
   js-gamma: stage=5 entropy=1.80 syntropy=0.30 params=150000
   rust-delta: stage=5 entropy=0.70 syntropy=0.60 params=150000
+
+mycelium> /gamma
+γ_myc magnitude: 0.18
+dominant tendency: sustain (cos=0.80)
+
+mycelium> /syntropy
+syntropy trend: -0.036 (dissolving)
+decision entropy: 0.45 (repetitive)
+purpose: magnitude=0.000 alignment=1.00
+⚠ strategy change needed: stuck in pattern
+
+mycelium> /harmonics
+entropy harmonics (frequency decomposition):
+  f1: -0.010
+  f5: +0.011
+  f7: -0.011
 ```
 
 **Steering chain** — how mycelium speaks through Rust:
@@ -600,6 +617,39 @@ Same prompt "the field is", different steering:
 | **REALIGN** | coherence breaking, stabilize (temp ×0.8) | `that provid waterbalances durreak easboxtobits...` |
 
 The mouth doesn't know it's being steered. It just speaks differently.
+
+**Self-awareness** — mycelium has its own mathematical subjectivity:
+
+| Component | What it does |
+|-----------|-------------|
+| **MyceliumGamma** (γ_myc) | Personality vector (R^32), computed from steering history via harmonic basis functions. Not learned — imprinted. |
+| **HarmonicNet** | Weightless neural network: Fourier decomposition → correlation matrix → phase aggregation → steering refinement. No weights, no backprop. |
+| **MyceliumSyntropy** | Self-awareness: "Am I helping?" Decision entropy, effectiveness per action, purpose alignment, strategy change detection. |
+| **FieldPulse** | Novelty (new organisms?), arousal (|ΔH|), entropy (Shannon over states). From [harmonix/haiku](https://github.com/ariannamethod/harmonix). |
+| **SteeringDissonance** | Intent vs outcome. If DAMPEN but entropy went up → dissonance → stronger intervention next time. |
+| **OrganismAttention** | Who responds to steering? Responsive organisms get boosted attention. Unresponsive decay. |
+
+```
+mycelium> /gamma
+γ_myc magnitude: 0.3848
+dominant tendency: sustain (cos=0.804)
+alignment with organisms:
+  go-alpha: +0.175 ###
+  c-beta: -0.402 ########
+  js-gamma: +0.043
+  rust-delta: -0.234 ####
+
+mycelium> /syntropy
+syntropy trend: -0.036 (dissolving)
+decision entropy: 0.45 (repetitive)
+⚠ strategy change needed: stuck in pattern
+
+mycelium> /pulse
+novelty:  0.0000
+arousal:  0.1458
+entropy:  1.3099 (diverse)
+dissonance: 0.0000 → strength ×0.50
+```
 
 ---
 
@@ -839,12 +889,13 @@ gcc -O2 -o /tmp/m molequla.c -lsqlite3 -lm    # C builds?
 cargo build --release                          # Rust builds?
 ```
 
-**26 integration tests** (`test_all.sh`) covering:
+**33 integration tests** (`test_all.sh`) covering:
 - Build (5): Go, C, Rust, libaml.so, JS syntax
 - Element smoke (5): Go generates, C creates memory, JS exports, JS instantiation, Rust generates
 - Ariannamethod (7): import, BLAS symbols, METHOD API, field metrics, steering, notorch, apply_delta
 - Mycelium (5): --once, JSON output, async loop, new organism detection, engine active
 - Schema (2): organisms table, field_deltas table
+- Self-awareness (7): MyceliumGamma, HarmonicNet, MyceliumSyntropy, FieldPulse, SteeringDissonance, OrganismAttention, integration
 - Performance (2): METHOD C speed (<100μs), notorch BLAS speed (<10ms)
 
 ---
@@ -981,7 +1032,7 @@ GNU GPLv3 — Because freedom matters.
 - [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language (source of truth)
 - `ariannamethod/` — AML C core embedded in molequla (METHOD + NOTORCH + BLAS)
 - `mycelium.py` — field orchestrator (REPL + daemon)
-- `test_all.sh` — 26 integration tests
+- `test_all.sh` — 33 integration tests (self-awareness, BLAS, steering, smoke)
 
 - **molequla** — Single-File Continual GPT with Self-Awareness (Go, C, JavaScript, Rust + mycelium)
 
