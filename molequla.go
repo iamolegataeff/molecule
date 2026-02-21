@@ -34,9 +34,6 @@ import (
 // a backward graph it will never use. gradEnabled is mercy for inference.
 var gradEnabled atomic.Bool
 
-// BLAS buffer pool — reusable contiguous memory for Matvec acceleration
-var accelBufPool = sync.Pool{New: func() any { return make([]float64, 0) }}
-
 func init() { gradEnabled.Store(true) }
 
 // ============================================================
@@ -747,28 +744,12 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 	nin := len(x.Data)
 	outData := make([]float64, nout)
 
-	// BLAS fast path: cblas_dgemv for both training and inference forward pass
-	if hasBLAS && nout*nin >= 256 {
-		needed := nout * nin
-		buf := accelBufPool.Get().([]float64)
-		if cap(buf) < needed {
-			buf = make([]float64, needed)
-		} else {
-			buf = buf[:needed]
+	for i := 0; i < nout; i++ {
+		sum := 0.0
+		for j := 0; j < nin; j++ {
+			sum += m.Rows[i].Data[j] * x.Data[j]
 		}
-		for i := 0; i < nout; i++ {
-			copy(buf[i*nin:], m.Rows[i].Data[:nin])
-		}
-		blasDgemv(nout, nin, buf, x.Data, outData)
-		accelBufPool.Put(buf[:0])
-	} else {
-		for i := 0; i < nout; i++ {
-			sum := 0.0
-			for j := 0; j < nin; j++ {
-				sum += m.Rows[i].Data[j] * x.Data[j]
-			}
-			outData[i] = sum
-		}
+		outData[i] = sum
 	}
 
 	out := NewVec(outData)
