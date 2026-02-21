@@ -2546,6 +2546,19 @@ impl SyntropyTracker {
 // ============================================================
 
 fn init_db(path: &str) -> Connection {
+    // Ensure parent directory exists (same pattern as SwarmRegistry::register)
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).ok();
+        }
+    }
+    // Remove stale WAL/SHM files if they exist from another process
+    let wal_path = format!("{}-wal", path);
+    let shm_path = format!("{}-shm", path);
+    if std::path::Path::new(&wal_path).exists() && !std::path::Path::new(path).exists() {
+        fs::remove_file(&wal_path).ok();
+        fs::remove_file(&shm_path).ok();
+    }
     let conn = Connection::open(path).expect("Failed to open SQLite");
     conn.execute_batch("
         PRAGMA journal_mode=WAL;
