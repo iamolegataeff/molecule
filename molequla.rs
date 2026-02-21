@@ -111,6 +111,14 @@ struct Config {
     freq_penalty: f64,
     #[serde(default = "default_presence_penalty")]
     presence_penalty: f64,
+
+    // co-occurrence enhancements (Stanley/Leo-style)
+    #[serde(default = "default_cooccur_window_size")]
+    cooccur_window_size: usize,
+    #[serde(default = "default_user_boost_strength")]
+    user_boost_strength: f64,
+    #[serde(default = "default_user_boost_decay")]
+    user_boost_decay: f64,
 }
 
 impl Default for Config {
@@ -147,6 +155,7 @@ impl Default for Config {
             overthinkc_rounds: 2, overthinkc_max_tokens: 32,
             conscience_window: 8, conscience_decay: 0.95, conscience_recovery: 1.005, conscience_floor: 0.3,
             freq_penalty: 0.1, presence_penalty: 0.1,
+            cooccur_window_size: 5, user_boost_strength: 0.3, user_boost_decay: 0.7,
         }
     }
 }
@@ -786,6 +795,9 @@ fn default_conscience_recovery() -> f64 { 1.005 }
 fn default_conscience_floor() -> f64 { 0.3 }
 fn default_freq_penalty() -> f64 { 0.1 }
 fn default_presence_penalty() -> f64 { 0.1 }
+fn default_cooccur_window_size() -> usize { 5 }
+fn default_user_boost_strength() -> f64 { 0.3 }
+fn default_user_boost_decay() -> f64 { 0.7 }
 
 impl EvolvingTokenizer {
     /// Rebuild stoi and special token IDs from tokens vec (for cross-impl compat)
@@ -1877,18 +1889,42 @@ impl GPT {
             // Save model-only probs (post-dissonance, pre-blend) for anti-field bypass
             let model_only_probs = probs.clone();
 
-            // Corpus field blend
+            // Corpus field blend (4gram→trigram→bigram, 70% n-gram + 30% cooccurrence, user boost)
             if let Some(field) = corpus_field {
                 let model_alpha = 1.0 / (1.0 + (-cfg.corpus_fade_k * (cfg.corpus_fade_threshold - entropy)).exp());
                 if model_alpha < 0.99 {
-                    let context: Vec<usize> = ids[ids.len().saturating_sub(3)..].to_vec();
+                    // Pass enough context for co-occurrence window (at least cooccur_window_size tokens)
+                    let ctx_len = cfg.cooccur_window_size.max(3);
+                    let context: Vec<usize> = ids[ids.len().saturating_sub(ctx_len)..].to_vec();
                     let corpus_probs = field.sample_distribution(&context, self.tok.vocab_size);
-                    let n = probs.len().min(corpus_probs.len());
-                    for j in 0..n {
-                        probs[j] = model_alpha * probs[j] + (1.0 - model_alpha) * corpus_probs[j];
+
+                    // Check if corpus has anything to say
+                    let has_corpus = corpus_probs.iter().any(|&p| p > 0.0);
+                    if has_corpus {
+                        let n = probs.len().min(corpus_probs.len());
+                        for j in 0..n {
+                            probs[j] = model_alpha * probs[j] + (1.0 - model_alpha) * corpus_probs[j];
+                        }
+                        let sum: f64 = probs.iter().sum();
+                        if sum > 0.0 { for p in probs.iter_mut() { *p /= sum; } }
                     }
-                    let sum: f64 = probs.iter().sum();
-                    if sum > 0.0 { for p in probs.iter_mut() { *p /= sum; } }
+
+                    // User word boost: multiplicative, scaled by (1-modelAlpha) so it fades
+                    // as the transformer strengthens. "The organism echoes the words of those
+                    // who speak to it" (Leo) — but grows out of it.
+                    if !field.user_boost.is_empty() {
+                        let boost_scale = 1.0 - model_alpha;
+                        if boost_scale > 0.01 {
+                            let mut total_b = 0.0f64;
+                            for (i, p) in probs.iter_mut().enumerate() {
+                                if let Some(&boost) = field.user_boost.get(&i) {
+                                    *p *= 1.0 + boost * boost_scale;
+                                }
+                                total_b += *p;
+                            }
+                            if total_b > 0.0 { for p in probs.iter_mut() { *p /= total_b; } }
+                        }
+                    }
                 }
             }
 
@@ -2107,27 +2143,51 @@ struct CooccurField {
     unigram: HashMap<usize, f64>,
     bigram: HashMap<usize, HashMap<usize, f64>>,
     trigram: HashMap<(usize, usize), HashMap<usize, f64>>,
+    fourgram_by_ctx: HashMap<[usize; 3], HashMap<usize, f64>>,  // [prev3,prev2,prev1] -> {next: count}
+    cooccur_window: HashMap<usize, HashMap<usize, f64>>,         // token -> {nearby_token: count} (Stanley-style proximity)
+    user_boost: HashMap<usize, f64>,                              // temporary user word boosts (Leo-style)
     built: bool,
 }
 
 impl CooccurField {
     fn new() -> Self {
-        CooccurField { unigram: HashMap::new(), bigram: HashMap::new(), trigram: HashMap::new(), built: false }
+        CooccurField {
+            unigram: HashMap::new(), bigram: HashMap::new(), trigram: HashMap::new(),
+            fourgram_by_ctx: HashMap::new(), cooccur_window: HashMap::new(),
+            user_boost: HashMap::new(), built: false,
+        }
     }
 
     fn build(&mut self, tok: &EvolvingTokenizer, docs: &[String]) {
         self.unigram.clear(); self.bigram.clear(); self.trigram.clear();
+        self.fourgram_by_ctx.clear(); self.cooccur_window.clear();
+        let window = Config::default().cooccur_window_size;
         for doc in docs {
             let ids = tok.encode(doc);
             for (i, &id) in ids.iter().enumerate() {
                 *self.unigram.entry(id).or_insert(0.0) += 1.0;
                 if i > 0 {
-                    self.bigram.entry(ids[i-1]).or_default().entry(id).or_insert(0.0);
-                    *self.bigram.get_mut(&ids[i-1]).unwrap().get_mut(&id).unwrap() += 1.0;
+                    *self.bigram.entry(ids[i-1]).or_default().entry(id).or_insert(0.0) += 1.0;
                 }
                 if i > 1 {
-                    self.trigram.entry((ids[i-2], ids[i-1])).or_default().entry(id).or_insert(0.0);
-                    *self.trigram.get_mut(&(ids[i-2], ids[i-1])).unwrap().get_mut(&id).unwrap() += 1.0;
+                    *self.trigram.entry((ids[i-2], ids[i-1])).or_default().entry(id).or_insert(0.0) += 1.0;
+                }
+            }
+            // 4-grams: deeper context for child+ stages
+            for i in 0..ids.len().saturating_sub(3) {
+                let ctx = [ids[i], ids[i+1], ids[i+2]];
+                *self.fourgram_by_ctx.entry(ctx).or_default().entry(ids[i+3]).or_insert(0.0) += 1.0;
+            }
+            // Co-occurrence window: "words that resonate together, stay together" (Stanley)
+            for i in 0..ids.len() {
+                let center = ids[i];
+                let start = if i >= window { i - window } else { 0 };
+                let end = (i + window + 1).min(ids.len());
+                for j in start..end {
+                    if i != j {
+                        let neighbor = ids[j];
+                        *self.cooccur_window.entry(center).or_default().entry(neighbor).or_insert(0.0) += 1.0;
+                    }
                 }
             }
         }
@@ -2138,50 +2198,140 @@ impl CooccurField {
     // Unlike build(), this does NOT clear existing data — it adds on top.
     // Used by overthinkg rings to enrich the field with the model's own output.
     fn ingest_tokens(&mut self, ids: &[usize]) {
+        self.ingest_tokens_weighted(ids, 1.0);
+    }
+
+    // IngestTokensWeighted adds n-gram counts weighted by a factor.
+    // High weight = this text matters more (coherent output). Low = less influence.
+    // Stanley's observe_shard weights by resonance score; we weight by inverse entropy.
+    fn ingest_tokens_weighted(&mut self, ids: &[usize], weight: f64) {
+        let window = Config::default().cooccur_window_size;
         for &id in ids {
-            *self.unigram.entry(id).or_insert(0.0) += 1.0;
+            *self.unigram.entry(id).or_insert(0.0) += weight;
         }
         for i in 0..ids.len().saturating_sub(1) {
             let first = ids[i];
             let second = ids[i + 1];
-            *self.bigram.entry(first).or_default().entry(second).or_insert(0.0) += 1.0;
+            *self.bigram.entry(first).or_default().entry(second).or_insert(0.0) += weight;
         }
         for i in 0..ids.len().saturating_sub(2) {
             let ctx = (ids[i], ids[i + 1]);
-            *self.trigram.entry(ctx).or_default().entry(ids[i + 2]).or_insert(0.0) += 1.0;
+            *self.trigram.entry(ctx).or_default().entry(ids[i + 2]).or_insert(0.0) += weight;
+        }
+        for i in 0..ids.len().saturating_sub(3) {
+            let ctx = [ids[i], ids[i+1], ids[i+2]];
+            *self.fourgram_by_ctx.entry(ctx).or_default().entry(ids[i+3]).or_insert(0.0) += weight;
+        }
+        // Co-occurrence window
+        for i in 0..ids.len() {
+            let center = ids[i];
+            let start = if i >= window { i - window } else { 0 };
+            let end = (i + window + 1).min(ids.len());
+            for j in start..end {
+                if i != j {
+                    let neighbor = ids[j];
+                    *self.cooccur_window.entry(center).or_default().entry(neighbor).or_insert(0.0) += weight;
+                }
+            }
         }
     }
 
+    // AbsorbUserWords sets temporary boosts for tokens the user just said.
+    // Like Leo's Santa Klaus but simpler: user words get multiplicative boost in generation.
+    fn absorb_user_words(&mut self, ids: &[usize]) {
+        let cfg = Config::default();
+        // Decay existing boosts first
+        self.user_boost.retain(|_, v| {
+            *v *= cfg.user_boost_decay;
+            *v >= 0.01
+        });
+        // Boost user's tokens
+        let strength = cfg.user_boost_strength;
+        for &id in ids {
+            *self.user_boost.entry(id).or_insert(0.0) += strength;
+        }
+    }
+
+    // DecayUserBoost reduces user word boosts after a generation.
+    fn decay_user_boost(&mut self) {
+        let decay = Config::default().user_boost_decay;
+        self.user_boost.retain(|_, v| {
+            *v *= decay;
+            *v >= 0.01
+        });
+    }
+
+    /// Returns the best n-gram distribution (4gram→trigram→bigram→unigram fallback),
+    /// blended 70% n-gram + 30% co-occurrence window. Matches Go SampleNext/generation blend.
     fn sample_distribution(&self, context: &[usize], vocab_size: usize) -> Vec<f64> {
-        let mut dist = vec![0.0; vocab_size];
+        let mut corpus_probs = vec![0.0; vocab_size];
         let len = context.len();
-        // Try trigram first
-        if len >= 2 {
+        let window = Config::default().cooccur_window_size;
+
+        // Best n-gram distribution: try 4-gram → trigram → bigram → unigram
+        let mut ngram_dist: Option<&HashMap<usize, f64>> = None;
+
+        if ngram_dist.is_none() && len >= 3 {
+            let ctx = [context[len-3], context[len-2], context[len-1]];
+            if let Some(d) = self.fourgram_by_ctx.get(&ctx) {
+                ngram_dist = Some(d);
+            }
+        }
+        if ngram_dist.is_none() && len >= 2 {
             let key = (context[len-2], context[len-1]);
-            if let Some(counts) = self.trigram.get(&key) {
-                let total: f64 = counts.values().sum();
-                if total > 0.0 {
-                    for (&tok, &c) in counts { if tok < vocab_size { dist[tok] = c / total; } }
-                    return dist;
+            if let Some(d) = self.trigram.get(&key) {
+                ngram_dist = Some(d);
+            }
+        }
+        if ngram_dist.is_none() && len >= 1 {
+            if let Some(d) = self.bigram.get(&context[len-1]) {
+                ngram_dist = Some(d);
+            }
+        }
+
+        // Build 70% n-gram component
+        if let Some(d) = ngram_dist {
+            let total_n: f64 = d.values().sum();
+            if total_n > 0.0 {
+                for (&tid, &cnt) in d {
+                    if tid < vocab_size { corpus_probs[tid] += 0.7 * cnt / total_n; }
+                }
+            }
+        } else {
+            // Unigram fallback (treated as n-gram component)
+            let total: f64 = self.unigram.values().sum();
+            if total > 0.0 {
+                for (&tok, &c) in &self.unigram {
+                    if tok < vocab_size { corpus_probs[tok] += 0.7 * c / total; }
                 }
             }
         }
-        // Bigram fallback
-        if len >= 1 {
-            if let Some(counts) = self.bigram.get(&context[len-1]) {
-                let total: f64 = counts.values().sum();
-                if total > 0.0 {
-                    for (&tok, &c) in counts { if tok < vocab_size { dist[tok] = c / total; } }
-                    return dist;
+
+        // 30% co-occurrence window component: "words that resonate together" (Stanley)
+        if len > 0 {
+            let ctx_slice = if len > window { &context[len-window..] } else { context };
+            let mut cooccur_sum: HashMap<usize, f64> = HashMap::new();
+            for &ctx_tok in ctx_slice {
+                if let Some(neighbors) = self.cooccur_window.get(&ctx_tok) {
+                    for (&tid, &cnt) in neighbors {
+                        *cooccur_sum.entry(tid).or_insert(0.0) += cnt;
+                    }
+                }
+            }
+            let total_c: f64 = cooccur_sum.values().sum();
+            if total_c > 0.0 {
+                for (&tid, &cnt) in &cooccur_sum {
+                    if tid < vocab_size { corpus_probs[tid] += 0.3 * cnt / total_c; }
                 }
             }
         }
-        // Unigram fallback
-        let total: f64 = self.unigram.values().sum();
+
+        // Normalize
+        let total: f64 = corpus_probs.iter().sum();
         if total > 0.0 {
-            for (&tok, &c) in &self.unigram { if tok < vocab_size { dist[tok] = c / total; } }
+            for p in corpus_probs.iter_mut() { *p /= total; }
         }
-        dist
+        corpus_probs
     }
 }
 
@@ -3247,10 +3397,14 @@ fn main() {
         }
 
         // Enrich corpus field with user input (after rebuild, so it's not lost)
+        // Active user word boost: organism absorbs user's vocabulary (Leo-style)
+        // Decays each generation, fades with model strength via sigmoid in generate_sentence
         {
             let m = model.lock().unwrap();
             let user_ids = m.tok.encode(&text);
-            corpus_field.lock().unwrap().ingest_tokens(&user_ids);
+            let mut cf = corpus_field.lock().unwrap();
+            cf.ingest_tokens(&user_ids);
+            cf.absorb_user_words(&user_ids);
         }
 
         let prompt = build_prompt(&db.lock().unwrap(), &text);
@@ -3294,11 +3448,19 @@ fn main() {
         println!("{}", answer);
         db_add_message(&db.lock().unwrap(), "assistant", &answer);
 
-        // Self-enrichment: organism's speech enriches its own corpus field
+        // Self-enrichment: own output enriches corpus field, weighted by coherence
+        // Low entropy = coherent speech = higher weight (Stanley's resonance weighting)
         if answer.len() > 3 {
             let m = model.lock().unwrap();
+            let last_ent = m.last_gen_entropy;
             let answer_ids = m.tok.encode(&answer);
-            corpus_field.lock().unwrap().ingest_tokens(&answer_ids);
+            let mut self_weight = 1.0;
+            if last_ent > 0.0 {
+                self_weight = (2.0 - last_ent).clamp(0.3, 2.0);
+            }
+            let mut cf = corpus_field.lock().unwrap();
+            cf.ingest_tokens_weighted(&answer_ids, self_weight);
+            cf.decay_user_boost();
         }
 
         // Consciousness: overthinkg rings (Feature 3)

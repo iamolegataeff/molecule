@@ -129,6 +129,9 @@ type Config struct {
 	CorpusGenMaxTokens   int     `json:"corpus_gen_max_tokens"`
 	CorpusFadeK          float64 `json:"corpus_fade_k"`          // sigmoid steepness for corpus→model transition
 	CorpusFadeThreshold  float64 `json:"corpus_fade_threshold"`  // entropy at which blend is 50/50
+	CooccurWindowSize    int     `json:"cooccur_window_size"`    // co-occurrence proximity window (Stanley-style)
+	UserBoostStrength    float64 `json:"user_boost_strength"`    // how strongly user's recent words are boosted
+	UserBoostDecay       float64 `json:"user_boost_decay"`       // per-generation decay of user word boost
 
 	// quantum buffer
 	QBMinBytes        int     `json:"qb_min_bytes"`
@@ -231,6 +234,9 @@ var CFG = Config{
 	CorpusGenMaxTokens:     120,
 	CorpusFadeK:            3.0,
 	CorpusFadeThreshold:    1.5,
+	CooccurWindowSize:      5,
+	UserBoostStrength:      0.3,
+	UserBoostDecay:         0.7,
 	QBMinBytes:             1024,
 	QBMinNovelty:           0.15,
 	QBCooldownSeconds:      60.0,
@@ -2897,40 +2903,97 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		}
 
 		// Adaptive corpus blend: corpus field fades as model becomes coherent
+		// Now with 4-gram + co-occurrence window + user word boost (Stanley/Leo-style)
 		if gpt.corpusField != nil && gpt.corpusField.Built {
 			modelAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
 			if modelAlpha < 0.99 {
-				var corpusDist map[int]float64
 				gpt.corpusField.mu.RLock()
-				// Try trigram first
-				if len(ids) >= 2 {
+
+				// Best n-gram distribution: try 4-gram → trigram → bigram
+				var ngramDist map[int]float64
+				if ngramDist == nil && len(ids) >= 3 {
+					ctx := [3]int{ids[len(ids)-3], ids[len(ids)-2], ids[len(ids)-1]}
+					if d, ok := gpt.corpusField.FourgramByCtx[ctx]; ok {
+						ngramDist = d
+					}
+				}
+				if ngramDist == nil && len(ids) >= 2 {
 					a, b := ids[len(ids)-2], ids[len(ids)-1]
-					if ctx, ok := gpt.corpusField.TrigramByContext[[2]int{a, b}]; ok {
-						corpusDist = ctx
+					if d, ok := gpt.corpusField.TrigramByContext[[2]int{a, b}]; ok {
+						ngramDist = d
 					}
 				}
-				// Fallback to bigram
-				if corpusDist == nil && len(ids) >= 1 {
+				if ngramDist == nil && len(ids) >= 1 {
 					prev := ids[len(ids)-1]
-					if ctx, ok := gpt.corpusField.BigramByFirst[prev]; ok {
-						corpusDist = ctx
+					if d, ok := gpt.corpusField.BigramByFirst[prev]; ok {
+						ngramDist = d
 					}
 				}
-				gpt.corpusField.mu.RUnlock()
-				if corpusDist != nil && len(corpusDist) > 0 {
-					totalC := 0.0
-					for _, cnt := range corpusDist {
-						totalC += cnt
+
+				// Co-occurrence window: "words that resonate together" (Stanley)
+				var cooccurSum map[int]float64
+				if len(ids) > 0 {
+					wnd := CFG.CooccurWindowSize
+					ctxSlice := ids
+					if len(ctxSlice) > wnd {
+						ctxSlice = ctxSlice[len(ctxSlice)-wnd:]
 					}
-					// Reuse pre-allocated buffer instead of per-token alloc
+					for _, ctxTok := range ctxSlice {
+						if neighbors, ok := gpt.corpusField.CooccurWindow[ctxTok]; ok {
+							if cooccurSum == nil {
+								cooccurSum = make(map[int]float64)
+							}
+							for tid, cnt := range neighbors {
+								cooccurSum[tid] += cnt
+							}
+						}
+					}
+				}
+
+				// User word boost snapshot
+				var userBoost map[int]float64
+				if len(gpt.corpusField.UserBoost) > 0 {
+					userBoost = make(map[int]float64, len(gpt.corpusField.UserBoost))
+					for k, v := range gpt.corpusField.UserBoost {
+						userBoost[k] = v
+					}
+				}
+
+				gpt.corpusField.mu.RUnlock()
+
+				// Build final corpus distribution: 70% n-gram + 30% co-occurrence
+				hasCorpus := ngramDist != nil || cooccurSum != nil
+				if hasCorpus {
 					for i := 0; i < len(probs) && i < len(corpusProbsBuf); i++ {
 						corpusProbsBuf[i] = 0
 					}
-					for tid, cnt := range corpusDist {
-						if tid < len(corpusProbsBuf) {
-							corpusProbsBuf[tid] = cnt / totalC
+					if ngramDist != nil {
+						totalN := 0.0
+						for _, cnt := range ngramDist {
+							totalN += cnt
+						}
+						if totalN > 0 {
+							for tid, cnt := range ngramDist {
+								if tid < len(corpusProbsBuf) {
+									corpusProbsBuf[tid] += 0.7 * cnt / totalN
+								}
+							}
 						}
 					}
+					if cooccurSum != nil {
+						totalC := 0.0
+						for _, cnt := range cooccurSum {
+							totalC += cnt
+						}
+						if totalC > 0 {
+							for tid, cnt := range cooccurSum {
+								if tid < len(corpusProbsBuf) {
+									corpusProbsBuf[tid] += 0.3 * cnt / totalC
+								}
+							}
+						}
+					}
+					// Blend model probs with corpus
 					totalB := 0.0
 					for i := range probs {
 						if i < len(corpusProbsBuf) {
@@ -2941,6 +3004,27 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 					if totalB > 0 {
 						for i := range probs {
 							probs[i] /= totalB
+						}
+					}
+				}
+
+				// User word boost: multiplicative, scaled by (1-modelAlpha) so it fades
+				// as the transformer strengthens. "The organism echoes the words of those
+				// who speak to it" (Leo) — but grows out of it.
+				if userBoost != nil {
+					boostScale := 1.0 - modelAlpha
+					if boostScale > 0.01 {
+						totalB := 0.0
+						for i := range probs {
+							if boost, ok := userBoost[i]; ok {
+								probs[i] *= (1.0 + boost*boostScale)
+							}
+							totalB += probs[i]
+						}
+						if totalB > 0 {
+							for i := range probs {
+								probs[i] /= totalB
+							}
 						}
 					}
 				}
@@ -3806,6 +3890,9 @@ type CooccurField struct {
 	Unigram          map[int]float64
 	BigramByFirst    map[int]map[int]float64    // prev → {next: count}
 	TrigramByContext map[[2]int]map[int]float64  // [prev2,prev1] → {next: count}
+	FourgramByCtx    map[[3]int]map[int]float64  // [prev3,prev2,prev1] → {next: count}
+	CooccurWindow    map[int]map[int]float64     // token → {nearby_token: count} (Stanley-style proximity)
+	UserBoost        map[int]float64             // temporary user word boosts (Leo-style)
 	Built            bool
 	mu               sync.RWMutex // RWMutex: reads (SampleNext) don't block each other
 }
@@ -3815,6 +3902,9 @@ func NewCooccurField() *CooccurField {
 		Unigram:          make(map[int]float64),
 		BigramByFirst:    make(map[int]map[int]float64),
 		TrigramByContext: make(map[[2]int]map[int]float64),
+		FourgramByCtx:    make(map[[3]int]map[int]float64),
+		CooccurWindow:    make(map[int]map[int]float64),
+		UserBoost:        make(map[int]float64),
 	}
 }
 
@@ -3823,6 +3913,10 @@ func (cf *CooccurField) BuildFromCorpus(tok *EvolvingTokenizer, docs []string) {
 	uni := make(map[int]float64)
 	bi := make(map[int]map[int]float64)
 	tri := make(map[[2]int]map[int]float64)
+	four := make(map[[3]int]map[int]float64)
+	cooc := make(map[int]map[int]float64)
+	window := CFG.CooccurWindowSize
+
 	for _, doc := range docs {
 		ids := tok.Encode(doc)
 		for _, id := range ids {
@@ -3842,38 +3936,140 @@ func (cf *CooccurField) BuildFromCorpus(tok *EvolvingTokenizer, docs []string) {
 			}
 			tri[ctx][ids[i+2]]++
 		}
+		// 4-grams: deeper context for child+ stages
+		for i := 0; i < len(ids)-3; i++ {
+			ctx := [3]int{ids[i], ids[i+1], ids[i+2]}
+			if four[ctx] == nil {
+				four[ctx] = make(map[int]float64)
+			}
+			four[ctx][ids[i+3]]++
+		}
+		// Co-occurrence window: "words that resonate together, stay together" (Stanley)
+		for i := 0; i < len(ids); i++ {
+			center := ids[i]
+			start := i - window
+			if start < 0 {
+				start = 0
+			}
+			end := i + window + 1
+			if end > len(ids) {
+				end = len(ids)
+			}
+			for j := start; j < end; j++ {
+				if i != j {
+					neighbor := ids[j]
+					if cooc[center] == nil {
+						cooc[center] = make(map[int]float64)
+					}
+					cooc[center][neighbor]++
+				}
+			}
+		}
 	}
 	// Atomic swap under lock
 	cf.mu.Lock()
 	cf.Unigram = uni
 	cf.BigramByFirst = bi
 	cf.TrigramByContext = tri
+	cf.FourgramByCtx = four
+	cf.CooccurWindow = cooc
 	cf.Built = true
 	cf.mu.Unlock()
 }
 
 // IngestTokens incrementally adds n-gram counts from a token sequence.
 // Unlike BuildFromCorpus, this does NOT clear existing data — it adds on top.
-// Used by overthinkg rings to enrich the field with the model's own output.
 func (cf *CooccurField) IngestTokens(ids []int) {
+	cf.IngestTokensWeighted(ids, 1.0)
+}
+
+// IngestTokensWeighted adds n-gram counts weighted by a factor.
+// High weight = this text matters more (coherent output). Low = less influence.
+// Stanley's observe_shard weights by resonance score; we weight by inverse entropy.
+func (cf *CooccurField) IngestTokensWeighted(ids []int, weight float64) {
 	cf.mu.Lock()
 	defer cf.mu.Unlock()
+	window := CFG.CooccurWindowSize
+
 	for _, id := range ids {
-		cf.Unigram[id]++
+		cf.Unigram[id] += weight
 	}
 	for i := 0; i < len(ids)-1; i++ {
 		first, second := ids[i], ids[i+1]
 		if cf.BigramByFirst[first] == nil {
 			cf.BigramByFirst[first] = make(map[int]float64)
 		}
-		cf.BigramByFirst[first][second]++
+		cf.BigramByFirst[first][second] += weight
 	}
 	for i := 0; i < len(ids)-2; i++ {
 		ctx := [2]int{ids[i], ids[i+1]}
 		if cf.TrigramByContext[ctx] == nil {
 			cf.TrigramByContext[ctx] = make(map[int]float64)
 		}
-		cf.TrigramByContext[ctx][ids[i+2]]++
+		cf.TrigramByContext[ctx][ids[i+2]] += weight
+	}
+	for i := 0; i < len(ids)-3; i++ {
+		ctx := [3]int{ids[i], ids[i+1], ids[i+2]}
+		if cf.FourgramByCtx[ctx] == nil {
+			cf.FourgramByCtx[ctx] = make(map[int]float64)
+		}
+		cf.FourgramByCtx[ctx][ids[i+3]] += weight
+	}
+	// Co-occurrence window
+	for i := 0; i < len(ids); i++ {
+		center := ids[i]
+		start := i - window
+		if start < 0 {
+			start = 0
+		}
+		end := i + window + 1
+		if end > len(ids) {
+			end = len(ids)
+		}
+		for j := start; j < end; j++ {
+			if i != j {
+				neighbor := ids[j]
+				if cf.CooccurWindow[center] == nil {
+					cf.CooccurWindow[center] = make(map[int]float64)
+				}
+				cf.CooccurWindow[center][neighbor] += weight
+			}
+		}
+	}
+}
+
+// AbsorbUserWords sets temporary boosts for tokens the user just said.
+// Like Leo's Santa Klaus but simpler: user words get multiplicative boost in generation.
+func (cf *CooccurField) AbsorbUserWords(ids []int) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+	// Decay existing boosts first
+	for k, v := range cf.UserBoost {
+		nv := v * CFG.UserBoostDecay
+		if nv < 0.01 {
+			delete(cf.UserBoost, k)
+		} else {
+			cf.UserBoost[k] = nv
+		}
+	}
+	// Boost user's tokens
+	strength := CFG.UserBoostStrength
+	for _, id := range ids {
+		cf.UserBoost[id] += strength
+	}
+}
+
+// DecayUserBoost reduces user word boosts after a generation.
+func (cf *CooccurField) DecayUserBoost() {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+	for k, v := range cf.UserBoost {
+		nv := v * CFG.UserBoostDecay
+		if nv < 0.01 {
+			delete(cf.UserBoost, k)
+		} else {
+			cf.UserBoost[k] = nv
+		}
 	}
 }
 
@@ -3883,13 +4079,28 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 	counts := make([]float64, vocabSize)
 	found := false
 
-	// Try trigram
-	if len(contextIDs) >= 2 {
+	// Try 4-gram (deepest context)
+	if len(contextIDs) >= 3 {
+		ctx := [3]int{contextIDs[len(contextIDs)-3], contextIDs[len(contextIDs)-2], contextIDs[len(contextIDs)-1]}
+		if d, ok := cf.FourgramByCtx[ctx]; ok {
+			for tid, v := range d {
+				if tid < vocabSize {
+					counts[tid] += v
+					found = true
+				}
+			}
+		}
+	}
+
+	// Fallback to trigram
+	if !found && len(contextIDs) >= 2 {
 		a, b := contextIDs[len(contextIDs)-2], contextIDs[len(contextIDs)-1]
 		if ctx, ok := cf.TrigramByContext[[2]int{a, b}]; ok {
 			for tid, v := range ctx {
-				counts[tid] += v
-				found = true
+				if tid < vocabSize {
+					counts[tid] += v
+					found = true
+				}
 			}
 		}
 	}
@@ -3899,8 +4110,10 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 		prev := contextIDs[len(contextIDs)-1]
 		if ctx, ok := cf.BigramByFirst[prev]; ok {
 			for tid, v := range ctx {
-				counts[tid] += v
-				found = true
+				if tid < vocabSize {
+					counts[tid] += v
+					found = true
+				}
 			}
 		}
 	}
@@ -3910,6 +4123,33 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 		for k, v := range cf.Unigram {
 			if k < vocabSize {
 				counts[k] = v
+			}
+		}
+	}
+
+	// Blend with co-occurrence window (background resonance, always active)
+	if len(contextIDs) > 0 {
+		wnd := CFG.CooccurWindowSize
+		ctxSlice := contextIDs
+		if len(ctxSlice) > wnd {
+			ctxSlice = ctxSlice[len(ctxSlice)-wnd:]
+		}
+		for _, ctxTok := range ctxSlice {
+			if neighbors, ok := cf.CooccurWindow[ctxTok]; ok {
+				for tid, cnt := range neighbors {
+					if tid < vocabSize {
+						counts[tid] += cnt * 0.3 // co-occurrence is softer than n-gram
+					}
+				}
+			}
+		}
+	}
+
+	// Apply user word boost (multiplicative)
+	if len(cf.UserBoost) > 0 {
+		for tid, boost := range cf.UserBoost {
+			if tid < vocabSize && counts[tid] > 0 {
+				counts[tid] *= (1.0 + boost)
 			}
 		}
 	}
@@ -5264,7 +5504,12 @@ func main() {
 		}
 
 		// Self-enrichment: user input enriches corpus field (AFTER rebuild, so it's not wiped)
-		cooccur.IngestTokens(tok.Encode(userText))
+		userIDs := tok.Encode(userText)
+		cooccur.IngestTokens(userIDs)
+
+		// Active user word boost: organism absorbs user's vocabulary (Leo-style)
+		// Decays each generation, fades with model strength via sigmoid in GenerateSentence
+		cooccur.AbsorbUserWords(userIDs)
 
 		prompt := buildPromptFromMemory(db, userText)
 
@@ -5302,10 +5547,21 @@ func main() {
 		fmt.Println(answer)
 		dbAddMessage(db, "assistant", answer)
 
-		// Self-enrichment: feed own output back into corpus field
-		// The organism's speech enriches its own trigram statistics
+		// Self-enrichment: own output enriches corpus field, weighted by coherence
+		// Low entropy = coherent speech = higher weight (Stanley's resonance weighting)
 		if len(answer) > 3 {
-			cooccur.IngestTokens(tok.Encode(answer))
+			selfWeight := 1.0
+			if model.lastGenEntropy > 0 {
+				selfWeight = 2.0 - model.lastGenEntropy
+				if selfWeight < 0.3 {
+					selfWeight = 0.3
+				}
+				if selfWeight > 2.0 {
+					selfWeight = 2.0
+				}
+			}
+			cooccur.IngestTokensWeighted(tok.Encode(answer), selfWeight)
+			cooccur.DecayUserBoost()
 		}
 
 		// Consciousness: overthinkg rings (Feature 3)

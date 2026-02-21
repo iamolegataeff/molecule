@@ -137,6 +137,9 @@ class Config:
     corpus_gen_max_tokens: int = 120
     corpus_fade_k: float = 3.0           # sigmoid steepness for corpus→model transition
     corpus_fade_threshold: float = 1.5   # entropy at which blend is 50/50
+    cooccur_window_size: int = 5         # co-occurrence proximity window (Stanley-style)
+    user_boost_strength: float = 0.3     # how strongly user's recent words are boosted
+    user_boost_decay: float = 0.7        # per-generation decay of user word boost
 
     # quantum buffer
     qb_min_bytes: int = 1024
@@ -401,6 +404,9 @@ class CooccurField:
         self.unigram = Counter()
         self.bigram = defaultdict(Counter)
         self.trigram = defaultdict(Counter)
+        self.fourgram = defaultdict(Counter)         # (prev3,prev2,prev1) → {next: count}
+        self.cooccur_window = defaultdict(Counter)   # token → {nearby_token: count} (Stanley-style proximity)
+        self.user_boost = {}                         # token → float, temporary user word boosts (Leo-style)
         self.total_tokens = 0
         self.lock = threading.Lock()  # protects concurrent access (overthinkg + background trainer)
 
@@ -409,7 +415,10 @@ class CooccurField:
             self.unigram.clear()
             self.bigram.clear()
             self.trigram.clear()
+            self.fourgram.clear()
+            self.cooccur_window.clear()
             self.total_tokens = 0
+            window = CFG.cooccur_window_size
             for doc in docs:
                 ids = tok.encode(doc)
                 for i, tid in enumerate(ids):
@@ -419,40 +428,146 @@ class CooccurField:
                         self.bigram[ids[i - 1]][tid] += 1
                     if i >= 2:
                         self.trigram[(ids[i - 2], ids[i - 1])][tid] += 1
+                # 4-grams: deeper context for child+ stages
+                for i in range(len(ids) - 3):
+                    ctx = (ids[i], ids[i + 1], ids[i + 2])
+                    self.fourgram[ctx][ids[i + 3]] += 1
+                # Co-occurrence window: "words that resonate together, stay together" (Stanley)
+                for i in range(len(ids)):
+                    center = ids[i]
+                    start = max(0, i - window)
+                    end = min(len(ids), i + window + 1)
+                    for j in range(start, end):
+                        if i != j:
+                            self.cooccur_window[center][ids[j]] += 1
 
     def ingest_tokens(self, ids):
         """Incrementally add n-gram counts from a token sequence.
         Unlike build_from_corpus, does NOT clear existing data — adds on top.
         Used by overthinkg rings to enrich the field with the model's own output."""
+        self.ingest_tokens_weighted(ids, 1.0)
+
+    def ingest_tokens_weighted(self, ids, weight):
+        """Add n-gram counts weighted by a factor.
+        High weight = this text matters more (coherent output). Low = less influence.
+        Stanley's observe_shard weights by resonance score; we weight by inverse entropy."""
         with self.lock:
+            window = CFG.cooccur_window_size
             for tid in ids:
-                self.unigram[tid] += 1
+                self.unigram[tid] += weight
             for i in range(len(ids) - 1):
-                self.bigram[ids[i]][ids[i + 1]] += 1
+                self.bigram[ids[i]][ids[i + 1]] += weight
             for i in range(len(ids) - 2):
-                self.trigram[(ids[i], ids[i + 1])][ids[i + 2]] += 1
+                self.trigram[(ids[i], ids[i + 1])][ids[i + 2]] += weight
+            for i in range(len(ids) - 3):
+                ctx = (ids[i], ids[i + 1], ids[i + 2])
+                self.fourgram[ctx][ids[i + 3]] += weight
+            # Co-occurrence window
+            for i in range(len(ids)):
+                center = ids[i]
+                start = max(0, i - window)
+                end = min(len(ids), i + window + 1)
+                for j in range(start, end):
+                    if i != j:
+                        self.cooccur_window[center][ids[j]] += weight
+
+    def absorb_user_words(self, ids):
+        """Set temporary boosts for tokens the user just said.
+        Like Leo's Santa Klaus but simpler: user words get multiplicative boost in generation."""
+        with self.lock:
+            # Decay existing boosts first
+            to_delete = []
+            for k, v in self.user_boost.items():
+                nv = v * CFG.user_boost_decay
+                if nv < 0.01:
+                    to_delete.append(k)
+                else:
+                    self.user_boost[k] = nv
+            for k in to_delete:
+                del self.user_boost[k]
+            # Boost user's tokens
+            strength = CFG.user_boost_strength
+            for tid in ids:
+                self.user_boost[tid] = self.user_boost.get(tid, 0.0) + strength
+
+    def decay_user_boost(self):
+        """Reduce user word boosts after a generation."""
+        with self.lock:
+            to_delete = []
+            for k, v in self.user_boost.items():
+                nv = v * CFG.user_boost_decay
+                if nv < 0.01:
+                    to_delete.append(k)
+                else:
+                    self.user_boost[k] = nv
+            for k in to_delete:
+                del self.user_boost[k]
 
     def sample_next(self, context_ids, temperature=1.0):
-        """Trigram -> bigram -> unigram fallback sampling."""
-        dist = None
-        if len(context_ids) >= 2:
+        """4-gram -> trigram -> bigram -> unigram fallback, with co-occurrence window + user boost."""
+        # Collect counts into a dict (sparse, like Go version)
+        counts = {}
+        found = False
+
+        # Try 4-gram (deepest context)
+        if len(context_ids) >= 3:
+            ctx = (context_ids[-3], context_ids[-2], context_ids[-1])
+            if ctx in self.fourgram and self.fourgram[ctx]:
+                for tid, v in self.fourgram[ctx].items():
+                    counts[tid] = counts.get(tid, 0.0) + v
+                    found = True
+
+        # Fallback to trigram
+        if not found and len(context_ids) >= 2:
             key = (context_ids[-2], context_ids[-1])
             if key in self.trigram and self.trigram[key]:
-                dist = self.trigram[key]
-        if dist is None and len(context_ids) >= 1:
+                for tid, v in self.trigram[key].items():
+                    counts[tid] = counts.get(tid, 0.0) + v
+                    found = True
+
+        # Fallback to bigram
+        if not found and len(context_ids) >= 1:
             if context_ids[-1] in self.bigram and self.bigram[context_ids[-1]]:
-                dist = self.bigram[context_ids[-1]]
-        if dist is None:
-            dist = self.unigram
-        if not dist:
+                for tid, v in self.bigram[context_ids[-1]].items():
+                    counts[tid] = counts.get(tid, 0.0) + v
+                    found = True
+
+        # Fallback to unigram
+        if not found:
+            for tid, v in self.unigram.items():
+                counts[tid] = counts.get(tid, 0.0) + v
+
+        if not counts:
             return 0
-        items = list(dist.items())
-        logits_raw = [math.log(max(c, 1e-10)) / max(temperature, 1e-6) for _, c in items]
-        probs = softmax_probs_float(logits_raw)
-        r = random.random()
+
+        # Blend with co-occurrence window (background resonance, always active)
+        if len(context_ids) > 0:
+            wnd = CFG.cooccur_window_size
+            ctx_slice = context_ids[-wnd:] if len(context_ids) > wnd else context_ids
+            for ctx_tok in ctx_slice:
+                if ctx_tok in self.cooccur_window:
+                    for tid, cnt in self.cooccur_window[ctx_tok].items():
+                        counts[tid] = counts.get(tid, 0.0) + cnt * 0.3  # co-occurrence is softer than n-gram
+
+        # Apply user word boost (multiplicative)
+        if self.user_boost:
+            for tid, boost in self.user_boost.items():
+                if tid in counts and counts[tid] > 0:
+                    counts[tid] *= (1.0 + boost)
+
+        # Apply temperature and sample
+        items = list(counts.items())
+        if temperature > 0:
+            logits_raw = [math.pow(max(c, 1e-10), 1.0 / max(temperature, 1e-6)) for _, c in items]
+        else:
+            logits_raw = [c for _, c in items]
+        total = sum(logits_raw)
+        if total <= 0:
+            return random.choice(items)[0] if items else 0
+        r = random.random() * total
         cumsum = 0.0
-        for i, p in enumerate(probs):
-            cumsum += p
+        for i, w in enumerate(logits_raw):
+            cumsum += w
             if cumsum >= r:
                 return items[i][0]
         return items[-1][0]
@@ -2158,29 +2273,80 @@ class GPT:
             model_only_probs = list(probs)
 
             # Adaptive corpus blend: corpus field fades as model becomes coherent
+            # Now with 4-gram + co-occurrence window + user word boost (Stanley/Leo-style)
             if self._corpus_field and self._corpus_field.bigram:
                 # sigmoid: low entropy -> high model_alpha, high entropy -> low model_alpha
                 model_alpha = 1.0 / (1.0 + math.exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)))
                 if model_alpha < 0.99:  # worth blending
-                    corpus_dist = None
-                    if len(ids) >= 2:
+                    # Best n-gram distribution: try 4-gram -> trigram -> bigram
+                    ngram_dist = None
+                    if ngram_dist is None and len(ids) >= 3:
+                        ctx = (ids[-3], ids[-2], ids[-1])
+                        if ctx in self._corpus_field.fourgram and self._corpus_field.fourgram[ctx]:
+                            ngram_dist = self._corpus_field.fourgram[ctx]
+                    if ngram_dist is None and len(ids) >= 2:
                         key = (ids[-2], ids[-1])
-                        if key in self._corpus_field.trigram:
-                            corpus_dist = self._corpus_field.trigram[key]  # read-only, no copy needed
-                    if corpus_dist is None and len(ids) >= 1:
-                        if ids[-1] in self._corpus_field.bigram:
-                            corpus_dist = self._corpus_field.bigram[ids[-1]]
-                    if corpus_dist:
-                        total_c = sum(corpus_dist.values())
+                        if key in self._corpus_field.trigram and self._corpus_field.trigram[key]:
+                            ngram_dist = self._corpus_field.trigram[key]
+                    if ngram_dist is None and len(ids) >= 1:
+                        if ids[-1] in self._corpus_field.bigram and self._corpus_field.bigram[ids[-1]]:
+                            ngram_dist = self._corpus_field.bigram[ids[-1]]
+
+                    # Co-occurrence window: "words that resonate together" (Stanley)
+                    cooccur_sum = None
+                    if len(ids) > 0:
+                        wnd = CFG.cooccur_window_size
+                        ctx_slice = ids[-wnd:] if len(ids) > wnd else ids
+                        for ctx_tok in ctx_slice:
+                            if ctx_tok in self._corpus_field.cooccur_window:
+                                if cooccur_sum is None:
+                                    cooccur_sum = {}
+                                for tid, cnt in self._corpus_field.cooccur_window[ctx_tok].items():
+                                    cooccur_sum[tid] = cooccur_sum.get(tid, 0.0) + cnt
+
+                    # User word boost snapshot
+                    user_boost = None
+                    if self._corpus_field.user_boost:
+                        user_boost = dict(self._corpus_field.user_boost)
+
+                    # Build final corpus distribution: 70% n-gram + 30% co-occurrence
+                    has_corpus = ngram_dist is not None or cooccur_sum is not None
+                    if has_corpus:
                         corpus_probs = [0.0] * len(probs)
-                        for tid, cnt in corpus_dist.items():
-                            if tid < len(corpus_probs):
-                                corpus_probs[tid] = cnt / total_c
-                        probs = [model_alpha * mp + (1.0 - model_alpha) * cp
-                                 for mp, cp in zip(probs, corpus_probs)]
-                        total_b = sum(probs)
+                        if ngram_dist is not None:
+                            total_n = sum(ngram_dist.values())
+                            if total_n > 0:
+                                for tid, cnt in ngram_dist.items():
+                                    if tid < len(corpus_probs):
+                                        corpus_probs[tid] += 0.7 * cnt / total_n
+                        if cooccur_sum is not None:
+                            total_c = sum(cooccur_sum.values())
+                            if total_c > 0:
+                                for tid, cnt in cooccur_sum.items():
+                                    if tid < len(corpus_probs):
+                                        corpus_probs[tid] += 0.3 * cnt / total_c
+                        # Blend model probs with corpus
+                        total_b = 0.0
+                        for i in range(len(probs)):
+                            if i < len(corpus_probs):
+                                probs[i] = model_alpha * probs[i] + (1.0 - model_alpha) * corpus_probs[i]
+                            total_b += probs[i]
                         if total_b > 0:
                             probs = [p / total_b for p in probs]
+
+                    # User word boost: multiplicative, scaled by (1-model_alpha) so it fades
+                    # as the transformer strengthens. "The organism echoes the words of those
+                    # who speak to it" (Leo) — but grows out of it.
+                    if user_boost is not None:
+                        boost_scale = 1.0 - model_alpha
+                        if boost_scale > 0.01:
+                            total_b = 0.0
+                            for i in range(len(probs)):
+                                if i in user_boost:
+                                    probs[i] *= (1.0 + user_boost[i] * boost_scale)
+                                total_b += probs[i]
+                            if total_b > 0:
+                                probs = [p / total_b for p in probs]
 
             # Consciousness: pattern breaking (Feature 2)
             # "I could follow the field, but I choose to speak for myself"
@@ -3203,8 +3369,14 @@ async def chat_main():
             update_reservoir_corpus(con, CFG.corpus_path, CFG.max_corpus_lines)
 
             # Self-enrichment: user input enriches corpus field (after rebuild, so it's not wiped)
+            user_ids = tok.encode(user_text)
             if model._corpus_field is not None:
-                model._corpus_field.ingest_tokens(tok.encode(user_text))
+                model._corpus_field.ingest_tokens(user_ids)
+
+            # Active user word boost: organism absorbs user's vocabulary (Leo-style)
+            # Decays each generation, fades with model strength via sigmoid in generate_sentence
+            if model._corpus_field is not None:
+                model._corpus_field.absorb_user_words(user_ids)
 
             prompt = build_prompt_from_memory(con, user_text)
 
@@ -3231,9 +3403,15 @@ async def chat_main():
             print(answer)
             db_add_message(con, "assistant", answer)
 
-            # Self-enrichment: organism's speech enriches its own corpus field
+            # Self-enrichment: own output enriches corpus field, weighted by coherence
+            # Low entropy = coherent speech = higher weight (Stanley's resonance weighting)
             if model._corpus_field is not None and len(answer) > 3:
-                model._corpus_field.ingest_tokens(tok.encode(answer))
+                self_weight = 1.0
+                if model.last_gen_entropy > 0:
+                    self_weight = 2.0 - model.last_gen_entropy
+                    self_weight = max(0.3, min(2.0, self_weight))
+                model._corpus_field.ingest_tokens_weighted(tok.encode(answer), self_weight)
+                model._corpus_field.decay_user_boost()
 
             # Consciousness: overthinkg rings (Feature 3)
             # "Let me re-read what I just said to strengthen my patterns."

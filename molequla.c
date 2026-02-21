@@ -109,6 +109,9 @@ typedef struct {
     int corpus_gen_max_tokens;
     double corpus_fade_k;            /* sigmoid steepness for corpus->model transition */
     double corpus_fade_threshold;    /* entropy at which blend is 50/50 */
+    int cooccur_window_size;         /* co-occurrence proximity window (Stanley-style) */
+    double user_boost_strength;      /* how strongly user's recent words are boosted */
+    double user_boost_decay;         /* per-generation decay of user word boost */
 
     /* quantum buffer */
     int qb_min_bytes;
@@ -209,6 +212,9 @@ static Config CFG = {
     .corpus_gen_max_tokens = 120,
     .corpus_fade_k = 3.0,
     .corpus_fade_threshold = 1.5,
+    .cooccur_window_size = 5,
+    .user_boost_strength = 0.3,
+    .user_boost_decay = 0.7,
     .qb_min_bytes = 1024,
     .qb_min_novelty = 0.15,
     .qb_cooldown_seconds = 60.0,
@@ -1880,6 +1886,9 @@ static void adam_step(AdamState *st, MatrixParam *mat, double lr) {
 /* CooccurField struct (functions defined later, after tokenizer) */
 typedef struct { int key[3]; double count; } TrigramEntry;
 typedef struct { int key[2]; double count; } BigramEntry;
+typedef struct { int key[4]; double count; } FourgramEntry;  /* [prev3,prev2,prev1,next] */
+typedef struct { int key[2]; double count; } CooccurWinEntry; /* [center,neighbor] */
+typedef struct { int token; double boost; } UserBoostEntry;
 #define COOCCUR_HASH_SIZE 16384
 
 typedef struct {
@@ -1889,11 +1898,21 @@ typedef struct {
     int n_trigrams, trigram_cap;
     BigramEntry *bigrams;
     int n_bigrams, bigram_cap;
+    FourgramEntry *fourgrams;
+    int n_fourgrams, fourgram_cap;
+    CooccurWinEntry *cooccur_win;   /* co-occurrence window entries */
+    int n_cooccur_win, cooccur_win_cap;
+    UserBoostEntry *user_boosts;    /* temporary user word boosts (Leo-style) */
+    int n_user_boosts, user_boost_cap;
     /* Hash indices for O(1) lookup */
     int *bigram_head;   /* [COOCCUR_HASH_SIZE] -> first index in bigrams[], or -1 */
     int *bigram_next;   /* [bigram_cap] -> next index with same hash, or -1 */
     int *trigram_head;  /* [COOCCUR_HASH_SIZE] -> first index in trigrams[], or -1 */
     int *trigram_next;  /* [trigram_cap] -> next index with same hash, or -1 */
+    int *fourgram_head; /* [COOCCUR_HASH_SIZE] -> first index in fourgrams[], or -1 */
+    int *fourgram_next; /* [fourgram_cap] -> next index with same hash, or -1 */
+    int *cooccur_win_head; /* [COOCCUR_HASH_SIZE] -> first index in cooccur_win[], or -1 */
+    int *cooccur_win_next; /* [cooccur_win_cap] -> next index with same hash, or -1 */
     int built;
     pthread_mutex_t mu; /* thread safety for ingest/build/sample */
 } CooccurField;
@@ -1904,6 +1923,13 @@ static inline unsigned int cooccur_bigram_hash(int prev) {
 }
 static inline unsigned int cooccur_trigram_hash(int a, int b) {
     return (((unsigned int)a * 2654435761u) ^ ((unsigned int)b * 2246822519u)) & (COOCCUR_HASH_SIZE - 1);
+}
+static inline unsigned int cooccur_fourgram_hash(int a, int b, int c) {
+    return (((unsigned int)a * 2654435761u) ^ ((unsigned int)b * 2246822519u) ^
+            ((unsigned int)c * 3266489917u)) & (COOCCUR_HASH_SIZE - 1);
+}
+static inline unsigned int cooccur_window_hash(int center) {
+    return ((unsigned int)center * 2654435761u) & (COOCCUR_HASH_SIZE - 1);
 }
 
 /* The GPT model */
@@ -2675,16 +2701,37 @@ static char *gpt_generate(GPT *g, const char *prompt) {
             softmax_probs(scaled, V, probs_buf);
         }
 
-        /* Adaptive corpus blend: corpus field fades as model becomes coherent */
+        /* Adaptive corpus blend: corpus field fades as model becomes coherent
+         * Now with 4-gram + co-occurrence window + user word boost (Stanley/Leo-style) */
         if (g->corpus_field && g->corpus_field->built && g->corpus_field->n_bigrams > 0) {
             pthread_mutex_lock(&g->corpus_field->mu);
             double model_alpha = 1.0 / (1.0 + exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)));
             if (model_alpha < 0.99) {
-                double *corpus_probs = calloc(V, sizeof(double));
-                double total_c = 0;
-                int found = 0;
-                /* Try trigram first (hash lookup) */
-                if (ids.len >= 2 && g->corpus_field->trigram_head) {
+                /* Best n-gram distribution: try 4-gram -> trigram -> bigram */
+                double *ngram_probs = NULL;
+                double ngram_total = 0;
+                int ngram_found = 0;
+
+                /* Try 4-gram first */
+                if (!ngram_found && ids.len >= 3 && g->corpus_field->fourgram_head) {
+                    int a = ids.items[ids.len - 3], b = ids.items[ids.len - 2], c = ids.items[ids.len - 1];
+                    unsigned int h = cooccur_fourgram_hash(a, b, c);
+                    for (int fi = g->corpus_field->fourgram_head[h]; fi >= 0; fi = g->corpus_field->fourgram_next[fi]) {
+                        if (g->corpus_field->fourgrams[fi].key[0] == a &&
+                            g->corpus_field->fourgrams[fi].key[1] == b &&
+                            g->corpus_field->fourgrams[fi].key[2] == c) {
+                            int tid = g->corpus_field->fourgrams[fi].key[3];
+                            if (tid < V) {
+                                if (!ngram_probs) ngram_probs = calloc(V, sizeof(double));
+                                ngram_probs[tid] += g->corpus_field->fourgrams[fi].count;
+                                ngram_total += g->corpus_field->fourgrams[fi].count;
+                                ngram_found = 1;
+                            }
+                        }
+                    }
+                }
+                /* Fallback to trigram */
+                if (!ngram_found && ids.len >= 2 && g->corpus_field->trigram_head) {
                     int a = ids.items[ids.len - 2], b = ids.items[ids.len - 1];
                     unsigned int h = cooccur_trigram_hash(a, b);
                     for (int ti = g->corpus_field->trigram_head[h]; ti >= 0; ti = g->corpus_field->trigram_next[ti]) {
@@ -2692,40 +2739,118 @@ static char *gpt_generate(GPT *g, const char *prompt) {
                             g->corpus_field->trigrams[ti].key[1] == b) {
                             int tid = g->corpus_field->trigrams[ti].key[2];
                             if (tid < V) {
-                                corpus_probs[tid] += g->corpus_field->trigrams[ti].count;
-                                total_c += g->corpus_field->trigrams[ti].count;
-                                found = 1;
+                                if (!ngram_probs) ngram_probs = calloc(V, sizeof(double));
+                                ngram_probs[tid] += g->corpus_field->trigrams[ti].count;
+                                ngram_total += g->corpus_field->trigrams[ti].count;
+                                ngram_found = 1;
                             }
                         }
                     }
                 }
-                /* Fallback to bigram (hash lookup) */
-                if (!found && ids.len >= 1 && g->corpus_field->bigram_head) {
+                /* Fallback to bigram */
+                if (!ngram_found && ids.len >= 1 && g->corpus_field->bigram_head) {
                     int prev = ids.items[ids.len - 1];
                     unsigned int h = cooccur_bigram_hash(prev);
                     for (int bi = g->corpus_field->bigram_head[h]; bi >= 0; bi = g->corpus_field->bigram_next[bi]) {
                         if (g->corpus_field->bigrams[bi].key[0] == prev) {
                             int tid = g->corpus_field->bigrams[bi].key[1];
                             if (tid < V) {
-                                corpus_probs[tid] += g->corpus_field->bigrams[bi].count;
-                                total_c += g->corpus_field->bigrams[bi].count;
-                                found = 1;
+                                if (!ngram_probs) ngram_probs = calloc(V, sizeof(double));
+                                ngram_probs[tid] += g->corpus_field->bigrams[bi].count;
+                                ngram_total += g->corpus_field->bigrams[bi].count;
+                                ngram_found = 1;
                             }
                         }
                     }
                 }
-                if (found && total_c > 0) {
+
+                /* Co-occurrence window: "words that resonate together" (Stanley) */
+                double *cooccur_sum = NULL;
+                double cooccur_total = 0;
+                if (ids.len > 0 && g->corpus_field->cooccur_win_head) {
+                    int wnd = CFG.cooccur_window_size;
+                    int cstart = ids.len > wnd ? ids.len - wnd : 0;
+                    for (int ci = cstart; ci < ids.len; ci++) {
+                        int center = ids.items[ci];
+                        unsigned int h = cooccur_window_hash(center);
+                        for (int wi = g->corpus_field->cooccur_win_head[h]; wi >= 0; wi = g->corpus_field->cooccur_win_next[wi]) {
+                            if (g->corpus_field->cooccur_win[wi].key[0] == center) {
+                                int tid = g->corpus_field->cooccur_win[wi].key[1];
+                                if (tid < V) {
+                                    if (!cooccur_sum) cooccur_sum = calloc(V, sizeof(double));
+                                    cooccur_sum[tid] += g->corpus_field->cooccur_win[wi].count;
+                                    cooccur_total += g->corpus_field->cooccur_win[wi].count;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* User word boost snapshot */
+                int n_boosts = g->corpus_field->n_user_boosts;
+                int *boost_tokens = NULL;
+                double *boost_values = NULL;
+                if (n_boosts > 0) {
+                    boost_tokens = malloc(sizeof(int) * n_boosts);
+                    boost_values = malloc(sizeof(double) * n_boosts);
+                    for (int i = 0; i < n_boosts; i++) {
+                        boost_tokens[i] = g->corpus_field->user_boosts[i].token;
+                        boost_values[i] = g->corpus_field->user_boosts[i].boost;
+                    }
+                }
+
+                int has_corpus = (ngram_found || cooccur_sum != NULL);
+                if (has_corpus) {
+                    /* Build final corpus distribution: 70% n-gram + 30% co-occurrence */
+                    double *corpus_probs = calloc(V, sizeof(double));
+                    if (ngram_found && ngram_total > 0) {
+                        for (int i = 0; i < V; i++) {
+                            corpus_probs[i] += 0.7 * ngram_probs[i] / ngram_total;
+                        }
+                    }
+                    if (cooccur_sum && cooccur_total > 0) {
+                        for (int i = 0; i < V; i++) {
+                            corpus_probs[i] += 0.3 * cooccur_sum[i] / cooccur_total;
+                        }
+                    }
+                    /* Blend model probs with corpus */
                     double total_b = 0;
                     for (int i = 0; i < V; i++) {
-                        corpus_probs[i] /= total_c;
                         probs_buf[i] = model_alpha * probs_buf[i] + (1.0 - model_alpha) * corpus_probs[i];
                         total_b += probs_buf[i];
                     }
                     if (total_b > 0) {
                         for (int i = 0; i < V; i++) probs_buf[i] /= total_b;
                     }
+                    free(corpus_probs);
                 }
-                free(corpus_probs);
+
+                /* User word boost: multiplicative, scaled by (1-modelAlpha) so it fades
+                 * as the transformer strengthens. "The organism echoes the words of those
+                 * who speak to it" (Leo) — but grows out of it. */
+                if (n_boosts > 0) {
+                    double boost_scale = 1.0 - model_alpha;
+                    if (boost_scale > 0.01) {
+                        double total_b = 0;
+                        for (int i = 0; i < V; i++) {
+                            for (int j = 0; j < n_boosts; j++) {
+                                if (boost_tokens[j] == i) {
+                                    probs_buf[i] *= (1.0 + boost_values[j] * boost_scale);
+                                    break;
+                                }
+                            }
+                            total_b += probs_buf[i];
+                        }
+                        if (total_b > 0) {
+                            for (int i = 0; i < V; i++) probs_buf[i] /= total_b;
+                        }
+                    }
+                }
+
+                free(ngram_probs);
+                free(cooccur_sum);
+                free(boost_tokens);
+                free(boost_values);
             }
             pthread_mutex_unlock(&g->corpus_field->mu);
         }
@@ -3156,14 +3281,32 @@ static CooccurField *cooccur_new(int vocab_size) {
     cf->trigrams = calloc(cf->trigram_cap, sizeof(TrigramEntry));
     cf->bigram_cap = 8192;
     cf->bigrams = calloc(cf->bigram_cap, sizeof(BigramEntry));
+    cf->fourgram_cap = 4096;
+    cf->fourgrams = calloc(cf->fourgram_cap, sizeof(FourgramEntry));
+    cf->cooccur_win_cap = 16384;
+    cf->cooccur_win = calloc(cf->cooccur_win_cap, sizeof(CooccurWinEntry));
+    cf->user_boost_cap = 1024;
+    cf->user_boosts = calloc(cf->user_boost_cap, sizeof(UserBoostEntry));
+    cf->n_user_boosts = 0;
     /* Hash index arrays */
     cf->bigram_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
     cf->trigram_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
+    cf->fourgram_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
+    cf->cooccur_win_head = malloc(sizeof(int) * COOCCUR_HASH_SIZE);
     cf->bigram_next = malloc(sizeof(int) * cf->bigram_cap);
     cf->trigram_next = malloc(sizeof(int) * cf->trigram_cap);
-    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) { cf->bigram_head[i] = -1; cf->trigram_head[i] = -1; }
+    cf->fourgram_next = malloc(sizeof(int) * cf->fourgram_cap);
+    cf->cooccur_win_next = malloc(sizeof(int) * cf->cooccur_win_cap);
+    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) {
+        cf->bigram_head[i] = -1;
+        cf->trigram_head[i] = -1;
+        cf->fourgram_head[i] = -1;
+        cf->cooccur_win_head[i] = -1;
+    }
     for (int i = 0; i < cf->bigram_cap; i++) cf->bigram_next[i] = -1;
     for (int i = 0; i < cf->trigram_cap; i++) cf->trigram_next[i] = -1;
+    for (int i = 0; i < cf->fourgram_cap; i++) cf->fourgram_next[i] = -1;
+    for (int i = 0; i < cf->cooccur_win_cap; i++) cf->cooccur_win_next[i] = -1;
     pthread_mutex_init(&cf->mu, NULL);
     return cf;
 }
@@ -3173,6 +3316,9 @@ static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs
     memset(cf->unigram, 0, sizeof(double) * cf->vocab_size);
     cf->n_trigrams = 0;
     cf->n_bigrams = 0;
+    cf->n_fourgrams = 0;
+    cf->n_cooccur_win = 0;
+    int window = CFG.cooccur_window_size;
     for (int d = 0; d < docs->len; d++) {
         IntArr ids = tok_encode(tok, docs->items[d]);
         for (int i = 0; i < ids.len; i++) {
@@ -3186,7 +3332,7 @@ static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs
             cf->bigrams[cf->n_bigrams].count = 1.0;
             cf->n_bigrams++;
         }
-        /* Store trigrams (simplified: just keep last N) */
+        /* Store trigrams */
         for (int i = 0; i < ids.len - 2 && cf->n_trigrams < cf->trigram_cap; i++) {
             cf->trigrams[cf->n_trigrams].key[0] = ids.items[i];
             cf->trigrams[cf->n_trigrams].key[1] = ids.items[i+1];
@@ -3194,12 +3340,44 @@ static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs
             cf->trigrams[cf->n_trigrams].count = 1.0;
             cf->n_trigrams++;
         }
+        /* 4-grams: deeper context for child+ stages */
+        for (int i = 0; i < ids.len - 3 && cf->n_fourgrams < cf->fourgram_cap; i++) {
+            cf->fourgrams[cf->n_fourgrams].key[0] = ids.items[i];
+            cf->fourgrams[cf->n_fourgrams].key[1] = ids.items[i+1];
+            cf->fourgrams[cf->n_fourgrams].key[2] = ids.items[i+2];
+            cf->fourgrams[cf->n_fourgrams].key[3] = ids.items[i+3];
+            cf->fourgrams[cf->n_fourgrams].count = 1.0;
+            cf->n_fourgrams++;
+        }
+        /* Co-occurrence window: "words that resonate together, stay together" (Stanley) */
+        for (int i = 0; i < ids.len; i++) {
+            int center = ids.items[i];
+            int start = i - window;
+            if (start < 0) start = 0;
+            int end = i + window + 1;
+            if (end > ids.len) end = ids.len;
+            for (int j = start; j < end && cf->n_cooccur_win < cf->cooccur_win_cap; j++) {
+                if (i != j) {
+                    cf->cooccur_win[cf->n_cooccur_win].key[0] = center;
+                    cf->cooccur_win[cf->n_cooccur_win].key[1] = ids.items[j];
+                    cf->cooccur_win[cf->n_cooccur_win].count = 1.0;
+                    cf->n_cooccur_win++;
+                }
+            }
+        }
         ia_free(&ids);
     }
     /* Build hash indices for O(1) lookup */
-    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) { cf->bigram_head[i] = -1; cf->trigram_head[i] = -1; }
+    for (int i = 0; i < COOCCUR_HASH_SIZE; i++) {
+        cf->bigram_head[i] = -1;
+        cf->trigram_head[i] = -1;
+        cf->fourgram_head[i] = -1;
+        cf->cooccur_win_head[i] = -1;
+    }
     for (int i = 0; i < cf->n_bigrams; i++) cf->bigram_next[i] = -1;
     for (int i = 0; i < cf->n_trigrams; i++) cf->trigram_next[i] = -1;
+    for (int i = 0; i < cf->n_fourgrams; i++) cf->fourgram_next[i] = -1;
+    for (int i = 0; i < cf->n_cooccur_win; i++) cf->cooccur_win_next[i] = -1;
     for (int i = 0; i < cf->n_bigrams; i++) {
         unsigned int h = cooccur_bigram_hash(cf->bigrams[i].key[0]);
         cf->bigram_next[i] = cf->bigram_head[h];
@@ -3210,25 +3388,36 @@ static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs
         cf->trigram_next[i] = cf->trigram_head[h];
         cf->trigram_head[h] = i;
     }
+    for (int i = 0; i < cf->n_fourgrams; i++) {
+        unsigned int h = cooccur_fourgram_hash(cf->fourgrams[i].key[0], cf->fourgrams[i].key[1], cf->fourgrams[i].key[2]);
+        cf->fourgram_next[i] = cf->fourgram_head[h];
+        cf->fourgram_head[h] = i;
+    }
+    for (int i = 0; i < cf->n_cooccur_win; i++) {
+        unsigned int h = cooccur_window_hash(cf->cooccur_win[i].key[0]);
+        cf->cooccur_win_next[i] = cf->cooccur_win_head[h];
+        cf->cooccur_win_head[h] = i;
+    }
     cf->built = 1;
     pthread_mutex_unlock(&cf->mu);
 }
 
-/* IngestTokens incrementally adds n-gram counts from a token sequence.
- * Unlike cooccur_build, this does NOT clear existing data — it adds on top.
- * Used by overthinkg rings to enrich the field with the model's own output. */
-static void cooccur_ingest_tokens(CooccurField *cf, const int *ids, int len) {
+/* IngestTokensWeighted adds n-gram counts weighted by a factor.
+ * High weight = this text matters more (coherent output). Low = less influence.
+ * Stanley's observe_shard weights by resonance score; we weight by inverse entropy. */
+static void cooccur_ingest_tokens_weighted(CooccurField *cf, const int *ids, int len, double weight) {
     pthread_mutex_lock(&cf->mu);
+    int window = CFG.cooccur_window_size;
     /* Unigrams */
     for (int i = 0; i < len; i++) {
         if (ids[i] < cf->vocab_size)
-            cf->unigram[ids[i]] += 1.0;
+            cf->unigram[ids[i]] += weight;
     }
     /* Bigrams */
     for (int i = 0; i < len - 1 && cf->n_bigrams < cf->bigram_cap; i++) {
         cf->bigrams[cf->n_bigrams].key[0] = ids[i];
         cf->bigrams[cf->n_bigrams].key[1] = ids[i+1];
-        cf->bigrams[cf->n_bigrams].count = 1.0;
+        cf->bigrams[cf->n_bigrams].count = weight;
         /* Update hash index */
         unsigned int h = cooccur_bigram_hash(ids[i]);
         cf->bigram_next[cf->n_bigrams] = cf->bigram_head[h];
@@ -3240,13 +3429,103 @@ static void cooccur_ingest_tokens(CooccurField *cf, const int *ids, int len) {
         cf->trigrams[cf->n_trigrams].key[0] = ids[i];
         cf->trigrams[cf->n_trigrams].key[1] = ids[i+1];
         cf->trigrams[cf->n_trigrams].key[2] = ids[i+2];
-        cf->trigrams[cf->n_trigrams].count = 1.0;
+        cf->trigrams[cf->n_trigrams].count = weight;
         /* Update hash index */
         unsigned int h = cooccur_trigram_hash(ids[i], ids[i+1]);
         cf->trigram_next[cf->n_trigrams] = cf->trigram_head[h];
         cf->trigram_head[h] = cf->n_trigrams;
         cf->n_trigrams++;
     }
+    /* 4-grams */
+    for (int i = 0; i < len - 3 && cf->n_fourgrams < cf->fourgram_cap; i++) {
+        cf->fourgrams[cf->n_fourgrams].key[0] = ids[i];
+        cf->fourgrams[cf->n_fourgrams].key[1] = ids[i+1];
+        cf->fourgrams[cf->n_fourgrams].key[2] = ids[i+2];
+        cf->fourgrams[cf->n_fourgrams].key[3] = ids[i+3];
+        cf->fourgrams[cf->n_fourgrams].count = weight;
+        /* Update hash index */
+        unsigned int h = cooccur_fourgram_hash(ids[i], ids[i+1], ids[i+2]);
+        cf->fourgram_next[cf->n_fourgrams] = cf->fourgram_head[h];
+        cf->fourgram_head[h] = cf->n_fourgrams;
+        cf->n_fourgrams++;
+    }
+    /* Co-occurrence window */
+    for (int i = 0; i < len; i++) {
+        int center = ids[i];
+        int start = i - window;
+        if (start < 0) start = 0;
+        int end = i + window + 1;
+        if (end > len) end = len;
+        for (int j = start; j < end && cf->n_cooccur_win < cf->cooccur_win_cap; j++) {
+            if (i != j) {
+                cf->cooccur_win[cf->n_cooccur_win].key[0] = center;
+                cf->cooccur_win[cf->n_cooccur_win].key[1] = ids[j];
+                cf->cooccur_win[cf->n_cooccur_win].count = weight;
+                unsigned int h = cooccur_window_hash(center);
+                cf->cooccur_win_next[cf->n_cooccur_win] = cf->cooccur_win_head[h];
+                cf->cooccur_win_head[h] = cf->n_cooccur_win;
+                cf->n_cooccur_win++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&cf->mu);
+}
+
+/* IngestTokens incrementally adds n-gram counts from a token sequence.
+ * Unlike cooccur_build, this does NOT clear existing data — it adds on top. */
+static void cooccur_ingest_tokens(CooccurField *cf, const int *ids, int len) {
+    cooccur_ingest_tokens_weighted(cf, ids, len, 1.0);
+}
+
+/* AbsorbUserWords sets temporary boosts for tokens the user just said.
+ * Like Leo's Santa Klaus but simpler: user words get multiplicative boost in generation. */
+static void cooccur_absorb_user_words(CooccurField *cf, const int *ids, int len) {
+    pthread_mutex_lock(&cf->mu);
+    /* Decay existing boosts first */
+    int new_count = 0;
+    for (int i = 0; i < cf->n_user_boosts; i++) {
+        double nv = cf->user_boosts[i].boost * CFG.user_boost_decay;
+        if (nv >= 0.01) {
+            cf->user_boosts[new_count] = cf->user_boosts[i];
+            cf->user_boosts[new_count].boost = nv;
+            new_count++;
+        }
+    }
+    cf->n_user_boosts = new_count;
+    /* Boost user's tokens */
+    double strength = CFG.user_boost_strength;
+    for (int i = 0; i < len; i++) {
+        /* Check if token already has a boost entry */
+        int found = 0;
+        for (int j = 0; j < cf->n_user_boosts; j++) {
+            if (cf->user_boosts[j].token == ids[i]) {
+                cf->user_boosts[j].boost += strength;
+                found = 1;
+                break;
+            }
+        }
+        if (!found && cf->n_user_boosts < cf->user_boost_cap) {
+            cf->user_boosts[cf->n_user_boosts].token = ids[i];
+            cf->user_boosts[cf->n_user_boosts].boost = strength;
+            cf->n_user_boosts++;
+        }
+    }
+    pthread_mutex_unlock(&cf->mu);
+}
+
+/* DecayUserBoost reduces user word boosts after a generation. */
+static void cooccur_decay_user_boost(CooccurField *cf) {
+    pthread_mutex_lock(&cf->mu);
+    int new_count = 0;
+    for (int i = 0; i < cf->n_user_boosts; i++) {
+        double nv = cf->user_boosts[i].boost * CFG.user_boost_decay;
+        if (nv >= 0.01) {
+            cf->user_boosts[new_count] = cf->user_boosts[i];
+            cf->user_boosts[new_count].boost = nv;
+            new_count++;
+        }
+    }
+    cf->n_user_boosts = new_count;
     pthread_mutex_unlock(&cf->mu);
 }
 
@@ -3255,14 +3534,39 @@ static int cooccur_sample_next(CooccurField *cf, const int *ctx, int ctx_len, do
     double *counts = calloc(cf->vocab_size, sizeof(double));
     int found = 0;
 
-    /* Try trigram (hash lookup) */
-    if (ctx_len >= 2 && cf->trigram_head) {
+    /* Try 4-gram (deepest context) */
+    if (ctx_len >= 3 && cf->fourgram_head) {
+        int a = ctx[ctx_len-3], b = ctx[ctx_len-2], c = ctx[ctx_len-1];
+        unsigned int h = cooccur_fourgram_hash(a, b, c);
+        for (int i = cf->fourgram_head[h]; i >= 0; i = cf->fourgram_next[i]) {
+            if (cf->fourgrams[i].key[0] == a && cf->fourgrams[i].key[1] == b &&
+                cf->fourgrams[i].key[2] == c) {
+                int d = cf->fourgrams[i].key[3];
+                if (d < cf->vocab_size) { counts[d] += cf->fourgrams[i].count; found = 1; }
+            }
+        }
+    }
+
+    /* Fallback to trigram (hash lookup) */
+    if (!found && ctx_len >= 2 && cf->trigram_head) {
         int a = ctx[ctx_len-2], b = ctx[ctx_len-1];
         unsigned int h = cooccur_trigram_hash(a, b);
         for (int i = cf->trigram_head[h]; i >= 0; i = cf->trigram_next[i]) {
             if (cf->trigrams[i].key[0] == a && cf->trigrams[i].key[1] == b) {
                 int c = cf->trigrams[i].key[2];
-                if (c < cf->vocab_size) { counts[c] += 1.0; found = 1; }
+                if (c < cf->vocab_size) { counts[c] += cf->trigrams[i].count; found = 1; }
+            }
+        }
+    }
+
+    /* Fallback to bigram */
+    if (!found && ctx_len >= 1 && cf->bigram_head) {
+        int prev = ctx[ctx_len-1];
+        unsigned int h = cooccur_bigram_hash(prev);
+        for (int i = cf->bigram_head[h]; i >= 0; i = cf->bigram_next[i]) {
+            if (cf->bigrams[i].key[0] == prev) {
+                int tid = cf->bigrams[i].key[1];
+                if (tid < cf->vocab_size) { counts[tid] += cf->bigrams[i].count; found = 1; }
             }
         }
     }
@@ -3270,6 +3574,32 @@ static int cooccur_sample_next(CooccurField *cf, const int *ctx, int ctx_len, do
     /* Fallback to unigram */
     if (!found) {
         memcpy(counts, cf->unigram, sizeof(double) * cf->vocab_size);
+    }
+
+    /* Blend with co-occurrence window (background resonance, always active) */
+    if (ctx_len > 0 && cf->cooccur_win_head) {
+        int wnd = CFG.cooccur_window_size;
+        int start = ctx_len > wnd ? ctx_len - wnd : 0;
+        for (int ci = start; ci < ctx_len; ci++) {
+            int center = ctx[ci];
+            unsigned int h = cooccur_window_hash(center);
+            for (int i = cf->cooccur_win_head[h]; i >= 0; i = cf->cooccur_win_next[i]) {
+                if (cf->cooccur_win[i].key[0] == center) {
+                    int tid = cf->cooccur_win[i].key[1];
+                    if (tid < cf->vocab_size) {
+                        counts[tid] += cf->cooccur_win[i].count * 0.3; /* co-occurrence is softer than n-gram */
+                    }
+                }
+            }
+        }
+    }
+
+    /* Apply user word boost (multiplicative) */
+    for (int i = 0; i < cf->n_user_boosts; i++) {
+        int tid = cf->user_boosts[i].token;
+        if (tid < cf->vocab_size && counts[tid] > 0) {
+            counts[tid] *= (1.0 + cf->user_boosts[i].boost);
+        }
     }
 
     /* Temperature + sample */
@@ -5056,11 +5386,13 @@ int main(int argc, char **argv) {
 
         /* Self-enrichment: feed user input into corpus field
          * (the organism absorbs what it hears) */
-        {
-            IntArr user_ids = tok_encode(tok, input);
-            cooccur_ingest_tokens(cooccur, user_ids.items, user_ids.len);
-            ia_free(&user_ids);
-        }
+        IntArr user_ids = tok_encode(tok, input);
+        cooccur_ingest_tokens(cooccur, user_ids.items, user_ids.len);
+
+        /* Active user word boost: organism absorbs user's vocabulary (Leo-style)
+         * Decays each generation, fades with model strength via sigmoid in gpt_generate */
+        cooccur_absorb_user_words(cooccur, user_ids.items, user_ids.len);
+        ia_free(&user_ids);
 
         char *answer;
         if (warmed_up) {
@@ -5129,12 +5461,19 @@ int main(int argc, char **argv) {
         printf("%s\n", answer);
         db_add_msg(db, "assistant", answer);
 
-        /* Self-enrichment: feed own output back into corpus field
-         * The organism's speech enriches its own trigram statistics */
+        /* Self-enrichment: own output enriches corpus field, weighted by coherence
+         * Low entropy = coherent speech = higher weight (Stanley's resonance weighting) */
         if (answer && strlen(answer) > 3) {
+            double self_weight = 1.0;
+            if (model->last_gen_entropy > 0) {
+                self_weight = 2.0 - model->last_gen_entropy;
+                if (self_weight < 0.3) self_weight = 0.3;
+                if (self_weight > 2.0) self_weight = 2.0;
+            }
             IntArr ans_ids = tok_encode(tok, answer);
-            cooccur_ingest_tokens(cooccur, ans_ids.items, ans_ids.len);
+            cooccur_ingest_tokens_weighted(cooccur, ans_ids.items, ans_ids.len, self_weight);
             ia_free(&ans_ids);
+            cooccur_decay_user_boost(cooccur);
         }
 
         /* Consciousness: overthinkg rings (Feature 3) */

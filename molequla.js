@@ -111,6 +111,9 @@ const CFG = {
     corpusGenMaxTokens: 120,
     corpusFadeK: 3.0,            // sigmoid steepness for corpus→model transition
     corpusFadeThreshold: 1.5,    // entropy at which blend is 50/50
+    cooccurWindowSize: 5,        // co-occurrence proximity window (Stanley-style)
+    userBoostStrength: 0.3,      // how strongly user's recent words are boosted
+    userBoostDecay: 0.7,         // per-generation decay of user word boost
 
     // syntropy
     syntropyWindow: 8,
@@ -500,6 +503,9 @@ class CooccurField {
         this.unigram = new Map();
         this.bigram = new Map();
         this.trigram = new Map();
+        this.fourgramByCtx = new Map();   // string key "a,b,c" → Map of {next: count}
+        this.cooccurWindow = new Map();   // token → Map of {nearby_token: count} (Stanley-style proximity)
+        this.userBoost = new Map();       // token → float (temporary user word boosts, Leo-style)
         this.totalTokens = 0;
     }
 
@@ -507,7 +513,10 @@ class CooccurField {
         this.unigram.clear();
         this.bigram.clear();
         this.trigram.clear();
+        this.fourgramByCtx.clear();
+        this.cooccurWindow.clear();
         this.totalTokens = 0;
+        const window = CFG.cooccurWindowSize;
 
         for (const doc of docs) {
             const ids = tok.encode(doc);
@@ -530,6 +539,27 @@ class CooccurField {
                     const tm = m2.get(key2);
                     tm.set(tid, (tm.get(tid) || 0) + 1);
                 }
+                // 4-grams: deeper context for child+ stages
+                if (i >= 3) {
+                    const fkey = ids[i - 3] + "," + ids[i - 2] + "," + ids[i - 1];
+                    if (!this.fourgramByCtx.has(fkey)) this.fourgramByCtx.set(fkey, new Map());
+                    const fm = this.fourgramByCtx.get(fkey);
+                    fm.set(tid, (fm.get(tid) || 0) + 1);
+                }
+            }
+            // Co-occurrence window: "words that resonate together, stay together" (Stanley)
+            for (let i = 0; i < ids.length; i++) {
+                const center = ids[i];
+                const start = Math.max(0, i - window);
+                const end = Math.min(ids.length, i + window + 1);
+                for (let j = start; j < end; j++) {
+                    if (i !== j) {
+                        const neighbor = ids[j];
+                        if (!this.cooccurWindow.has(center)) this.cooccurWindow.set(center, new Map());
+                        const cm = this.cooccurWindow.get(center);
+                        cm.set(neighbor, (cm.get(neighbor) || 0) + 1);
+                    }
+                }
             }
         }
     }
@@ -538,14 +568,22 @@ class CooccurField {
     // Unlike buildFromCorpus, this does NOT clear existing data — it adds on top.
     // Used by overthinkg rings to enrich the field with the model's own output.
     ingestTokens(ids) {
+        this.ingestTokensWeighted(ids, 1.0);
+    }
+
+    // IngestTokensWeighted adds n-gram counts weighted by a factor.
+    // High weight = this text matters more (coherent output). Low = less influence.
+    // Stanley's observe_shard weights by resonance score; we weight by inverse entropy.
+    ingestTokensWeighted(ids, weight) {
+        const window = CFG.cooccurWindowSize;
         for (const id of ids) {
-            this.unigram.set(id, (this.unigram.get(id) || 0) + 1);
+            this.unigram.set(id, (this.unigram.get(id) || 0) + weight);
         }
         for (let i = 0; i < ids.length - 1; i++) {
             const first = ids[i], second = ids[i + 1];
             if (!this.bigram.has(first)) this.bigram.set(first, new Map());
             const bm = this.bigram.get(first);
-            bm.set(second, (bm.get(second) || 0) + 1);
+            bm.set(second, (bm.get(second) || 0) + weight);
         }
         for (let i = 0; i < ids.length - 2; i++) {
             const k1 = ids[i], k2 = ids[i + 1], k3 = ids[i + 2];
@@ -553,42 +591,152 @@ class CooccurField {
             const m2 = this.trigram.get(k1);
             if (!m2.has(k2)) m2.set(k2, new Map());
             const tm = m2.get(k2);
-            tm.set(k3, (tm.get(k3) || 0) + 1);
+            tm.set(k3, (tm.get(k3) || 0) + weight);
+        }
+        for (let i = 0; i < ids.length - 3; i++) {
+            const fkey = ids[i] + "," + ids[i + 1] + "," + ids[i + 2];
+            if (!this.fourgramByCtx.has(fkey)) this.fourgramByCtx.set(fkey, new Map());
+            const fm = this.fourgramByCtx.get(fkey);
+            fm.set(ids[i + 3], (fm.get(ids[i + 3]) || 0) + weight);
+        }
+        // Co-occurrence window
+        for (let i = 0; i < ids.length; i++) {
+            const center = ids[i];
+            const start = Math.max(0, i - window);
+            const end = Math.min(ids.length, i + window + 1);
+            for (let j = start; j < end; j++) {
+                if (i !== j) {
+                    const neighbor = ids[j];
+                    if (!this.cooccurWindow.has(center)) this.cooccurWindow.set(center, new Map());
+                    const cm = this.cooccurWindow.get(center);
+                    cm.set(neighbor, (cm.get(neighbor) || 0) + weight);
+                }
+            }
+        }
+    }
+
+    // AbsorbUserWords sets temporary boosts for tokens the user just said.
+    // Like Leo's Santa Klaus but simpler: user words get multiplicative boost in generation.
+    absorbUserWords(ids) {
+        // Decay existing boosts first
+        for (const [k, v] of this.userBoost) {
+            const nv = v * CFG.userBoostDecay;
+            if (nv < 0.01) {
+                this.userBoost.delete(k);
+            } else {
+                this.userBoost.set(k, nv);
+            }
+        }
+        // Boost user's tokens
+        const strength = CFG.userBoostStrength;
+        for (const id of ids) {
+            this.userBoost.set(id, (this.userBoost.get(id) || 0) + strength);
+        }
+    }
+
+    // DecayUserBoost reduces user word boosts after a generation.
+    decayUserBoost() {
+        for (const [k, v] of this.userBoost) {
+            const nv = v * CFG.userBoostDecay;
+            if (nv < 0.01) {
+                this.userBoost.delete(k);
+            } else {
+                this.userBoost.set(k, nv);
+            }
         }
     }
 
     sampleNext(contextIds, temperature) {
-        // And lo, trigram -> bigram -> unigram fallback, like a drunk leaning on smaller drunks.
+        // And lo, 4gram -> trigram -> bigram -> unigram fallback, like a drunk leaning on smaller drunks.
         if (!temperature) temperature = 1.0;
-        let dist = null;
+        const counts = new Map();
+        let found = false;
 
-        if (contextIds.length >= 2) {
+        // Try 4-gram (deepest context)
+        if (contextIds.length >= 3) {
+            const fkey = contextIds[contextIds.length - 3] + "," + contextIds[contextIds.length - 2] + "," + contextIds[contextIds.length - 1];
+            const fm = this.fourgramByCtx.get(fkey);
+            if (fm && fm.size > 0) {
+                for (const [tid, v] of fm) {
+                    counts.set(tid, (counts.get(tid) || 0) + v);
+                    found = true;
+                }
+            }
+        }
+
+        // Fallback to trigram
+        if (!found && contextIds.length >= 2) {
             const k1 = contextIds[contextIds.length - 2];
             const k2 = contextIds[contextIds.length - 1];
             const m2 = this.trigram.get(k1);
             if (m2) {
                 const tm = m2.get(k2);
-                if (tm && tm.size > 0) dist = tm;
+                if (tm && tm.size > 0) {
+                    for (const [tid, v] of tm) {
+                        counts.set(tid, (counts.get(tid) || 0) + v);
+                        found = true;
+                    }
+                }
             }
         }
-        if (dist === null && contextIds.length >= 1) {
+
+        // Fallback to bigram
+        if (!found && contextIds.length >= 1) {
             const bkey = contextIds[contextIds.length - 1];
             if (this.bigram.has(bkey) && this.bigram.get(bkey).size > 0) {
-                dist = this.bigram.get(bkey);
+                const bm = this.bigram.get(bkey);
+                for (const [tid, v] of bm) {
+                    counts.set(tid, (counts.get(tid) || 0) + v);
+                    found = true;
+                }
             }
         }
-        if (dist === null) dist = this.unigram;
-        if (!dist || dist.size === 0) return 0;
 
-        const items = Array.from(dist.entries());
-        const logitsRaw = items.map(([, c]) =>
-            Math.log(Math.max(c, 1e-10)) / Math.max(temperature, 1e-6));
-        const probs = softmaxProbsFloat(logitsRaw);
+        // Fallback to unigram
+        if (!found) {
+            for (const [k, v] of this.unigram) {
+                counts.set(k, v);
+            }
+        }
 
-        let r = rng();
+        if (counts.size === 0) return 0;
+
+        // Blend with co-occurrence window (background resonance, always active)
+        if (contextIds.length > 0) {
+            const wnd = CFG.cooccurWindowSize;
+            const ctxSlice = contextIds.length > wnd
+                ? contextIds.slice(-wnd) : contextIds;
+            for (const ctxTok of ctxSlice) {
+                const neighbors = this.cooccurWindow.get(ctxTok);
+                if (neighbors) {
+                    for (const [tid, cnt] of neighbors) {
+                        counts.set(tid, (counts.get(tid) || 0) + cnt * 0.3); // co-occurrence is softer than n-gram
+                    }
+                }
+            }
+        }
+
+        // Apply user word boost (multiplicative)
+        if (this.userBoost.size > 0) {
+            for (const [tid, boost] of this.userBoost) {
+                const cur = counts.get(tid);
+                if (cur !== undefined && cur > 0) {
+                    counts.set(tid, cur * (1.0 + boost));
+                }
+            }
+        }
+
+        // Apply temperature and sample
+        const items = Array.from(counts.entries());
+        const vals = items.map(([, c]) => c > 0 && temperature > 0 ? Math.pow(c, 1.0 / temperature) : c);
+        let total = 0;
+        for (const v of vals) total += v;
+        if (total <= 0) return 0;
+
+        let r = rng() * total;
         let cumsum = 0;
-        for (let i = 0; i < probs.length; i++) {
-            cumsum += probs[i];
+        for (let i = 0; i < vals.length; i++) {
+            cumsum += vals[i];
             if (cumsum >= r) return items[i][0];
         }
         return items[items.length - 1][0];
@@ -2419,34 +2567,81 @@ class GPT {
             }
 
             // Adaptive corpus blend: corpus field fades as model becomes coherent
+            // Now with 4-gram + co-occurrence window + user word boost (Stanley/Leo-style)
             if (this._corpusField && this._corpusField.bigram.size > 0) {
                 const modelAlpha = 1.0 / (1.0 + Math.exp(-CFG.corpusFadeK * (CFG.corpusFadeThreshold - entropy)));
                 if (modelAlpha < 0.99) {
-                    let corpusDist = null;
-                    // Try trigram first
-                    if (ids.length >= 2) {
+                    // Best n-gram distribution: try 4-gram → trigram → bigram
+                    let ngramDist = null;
+                    if (ngramDist === null && ids.length >= 3) {
+                        const fkey = ids[ids.length - 3] + "," + ids[ids.length - 2] + "," + ids[ids.length - 1];
+                        const fm = this._corpusField.fourgramByCtx.get(fkey);
+                        if (fm && fm.size > 0) ngramDist = fm;
+                    }
+                    if (ngramDist === null && ids.length >= 2) {
                         const tk1 = ids[ids.length - 2];
                         const tk2 = ids[ids.length - 1];
                         const m2 = this._corpusField.trigram.get(tk1);
                         if (m2) {
                             const tm = m2.get(tk2);
-                            if (tm) corpusDist = tm;
+                            if (tm && tm.size > 0) ngramDist = tm;
                         }
                     }
-                    // Fallback to bigram
-                    if (!corpusDist && ids.length >= 1) {
+                    if (ngramDist === null && ids.length >= 1) {
                         const bkey = ids[ids.length - 1];
                         if (this._corpusField.bigram.has(bkey)) {
-                            corpusDist = this._corpusField.bigram.get(bkey);
+                            const bm = this._corpusField.bigram.get(bkey);
+                            if (bm && bm.size > 0) ngramDist = bm;
                         }
                     }
-                    if (corpusDist) {
-                        let totalC = 0;
-                        for (const cnt of corpusDist.values()) totalC += cnt;
-                        const corpusProbs = new Array(probs.length).fill(0);
-                        for (const [tid, cnt] of corpusDist.entries()) {
-                            if (tid < corpusProbs.length) corpusProbs[tid] = cnt / totalC;
+
+                    // Co-occurrence window: "words that resonate together" (Stanley)
+                    let cooccurSum = null;
+                    if (ids.length > 0) {
+                        const wnd = CFG.cooccurWindowSize;
+                        const ctxSlice = ids.length > wnd ? ids.slice(-wnd) : ids;
+                        for (const ctxTok of ctxSlice) {
+                            const neighbors = this._corpusField.cooccurWindow.get(ctxTok);
+                            if (neighbors) {
+                                if (cooccurSum === null) cooccurSum = new Map();
+                                for (const [tid, cnt] of neighbors) {
+                                    cooccurSum.set(tid, (cooccurSum.get(tid) || 0) + cnt);
+                                }
+                            }
                         }
+                    }
+
+                    // User word boost snapshot
+                    const userBoost = this._corpusField.userBoost.size > 0
+                        ? new Map(this._corpusField.userBoost) : null;
+
+                    // Build final corpus distribution: 70% n-gram + 30% co-occurrence
+                    const hasCorpus = ngramDist !== null || cooccurSum !== null;
+                    if (hasCorpus) {
+                        const corpusProbs = new Array(probs.length).fill(0);
+                        if (ngramDist !== null) {
+                            let totalN = 0;
+                            for (const cnt of ngramDist.values()) totalN += cnt;
+                            if (totalN > 0) {
+                                for (const [tid, cnt] of ngramDist) {
+                                    if (tid < corpusProbs.length) {
+                                        corpusProbs[tid] += 0.7 * cnt / totalN;
+                                    }
+                                }
+                            }
+                        }
+                        if (cooccurSum !== null) {
+                            let totalC = 0;
+                            for (const cnt of cooccurSum.values()) totalC += cnt;
+                            if (totalC > 0) {
+                                for (const [tid, cnt] of cooccurSum) {
+                                    if (tid < corpusProbs.length) {
+                                        corpusProbs[tid] += 0.3 * cnt / totalC;
+                                    }
+                                }
+                            }
+                        }
+                        // Blend model probs with corpus
                         let totalB = 0;
                         for (let i = 0; i < probs.length; i++) {
                             probs[i] = modelAlpha * probs[i] + (1.0 - modelAlpha) * corpusProbs[i];
@@ -2454,6 +2649,26 @@ class GPT {
                         }
                         if (totalB > 0) {
                             for (let i = 0; i < probs.length; i++) probs[i] /= totalB;
+                        }
+                    }
+
+                    // User word boost: multiplicative, scaled by (1-modelAlpha) so it fades
+                    // as the transformer strengthens. "The organism echoes the words of those
+                    // who speak to it" (Leo) — but grows out of it.
+                    if (userBoost !== null) {
+                        const boostScale = 1.0 - modelAlpha;
+                        if (boostScale > 0.01) {
+                            let totalB = 0;
+                            for (let i = 0; i < probs.length; i++) {
+                                const boost = userBoost.get(i);
+                                if (boost !== undefined) {
+                                    probs[i] *= (1.0 + boost * boostScale);
+                                }
+                                totalB += probs[i];
+                            }
+                            if (totalB > 0) {
+                                for (let i = 0; i < probs.length; i++) probs[i] /= totalB;
+                            }
                         }
                     }
                 }
@@ -3450,6 +3665,9 @@ async function handleUserMessage(text) {
         const userIds = _tok.encode(text);
         if (userIds.length > 0) {
             _field.ingestTokens(userIds);
+            // Active user word boost: organism absorbs user's vocabulary (Leo-style)
+            // Decays each generation, fades with model strength via sigmoid in generateSentence
+            _field.absorbUserWords(userIds);
         }
     }
 
@@ -3464,12 +3682,19 @@ async function handleUserMessage(text) {
     appendChat("molequla", answer);
     await DB.addMessage("assistant", answer);
 
-    // Self-enrichment: feed own output back into corpus field
-    // The organism's speech enriches its own trigram statistics
+    // Self-enrichment: own output enriches corpus field, weighted by coherence
+    // Low entropy = coherent speech = higher weight (Stanley's resonance weighting)
     if (_field && answer.length > 3) {
+        let selfWeight = 1.0;
+        if (_model.lastGenEntropy > 0) {
+            selfWeight = 2.0 - _model.lastGenEntropy;
+            if (selfWeight < 0.3) selfWeight = 0.3;
+            if (selfWeight > 2.0) selfWeight = 2.0;
+        }
         const answerIds = _tok.encode(answer);
         if (answerIds.length > 0) {
-            _field.ingestTokens(answerIds);
+            _field.ingestTokensWeighted(answerIds, selfWeight);
+            _field.decayUserBoost();
         }
     }
 
