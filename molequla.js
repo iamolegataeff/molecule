@@ -3714,9 +3714,12 @@ async function handleUserMessage(text) {
 
     // Consciousness: overthinkg rings (Feature 3)
     // "Let me re-read what I just said to strengthen my patterns."
-    // Guard against ontogenesis race: snapshot nEmbd before call,
-    // skip if dimensions changed (model grew mid-generation).
-    if (CFG.overthinkcRounds > 0 && answer.length > 3 && _field) {
+    // Only activate at final growth stage — during ontogenesis, dimension changes
+    // between growth and overthinkcRings cause crashes. At final stage, no more
+    // growth is possible so the race condition is eliminated.
+    const finalStageJS = CFG.growthStages.length - 1;
+    if (CFG.overthinkcRounds > 0 && answer.length > 3 && _field
+        && _model.currentGrowthStage() >= finalStageJS) {
         const snapEmbd = _model.nEmbd;
         try {
             if (_model.nEmbd === snapEmbd) {

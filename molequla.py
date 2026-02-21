@@ -3415,7 +3415,13 @@ async def chat_main():
 
             # Consciousness: overthinkg rings (Feature 3)
             # "Let me re-read what I just said to strengthen my patterns."
-            if CFG.overthinkc_rounds > 0 and len(answer) > 3 and model._corpus_field is not None:
+            # Only activate at final growth stage — during ontogenesis the background
+            # thread races with dimension changes, causing crashes. At final stage,
+            # no more growth is possible so the race condition is eliminated.
+            final_stage = len(CFG.growth_stages) - 1
+            if (CFG.overthinkc_rounds > 0 and len(answer) > 3
+                    and model._corpus_field is not None
+                    and model.current_growth_stage() >= final_stage):
                 snap_embd = model.n_embd  # snapshot before thread launch
                 def _overthink(text, mdl, tkn, fld, rounds, snap_n_embd):
                     try:

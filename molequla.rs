@@ -3478,10 +3478,13 @@ fn main() {
 
         // Consciousness: overthinkg rings (Feature 3)
         // "Let me re-read what I just said to strengthen my patterns."
-        // SAFETY: snapshot n_embd before spawn — if ontogenesis changes model
-        // dimensions between scheduling and execution, skip to avoid panics.
+        // Only activate at final growth stage — during ontogenesis the spawned thread
+        // races with dimension changes, causing panics. At final stage, no more growth
+        // is possible so the race condition is eliminated.
         let overthinkc_rounds = cfg.overthinkc_rounds;
-        if overthinkc_rounds > 0 && answer.len() > 3 {
+        let final_stage = cfg.growth_stages.len() as i32 - 1;
+        let current_stage = model.lock().unwrap().current_growth_stage();
+        if overthinkc_rounds > 0 && answer.len() > 3 && current_stage >= final_stage {
             let snap_embd = model.lock().unwrap().n_embd;
             let m_clone = Arc::clone(&model);
             let cf_clone = Arc::clone(&corpus_field);

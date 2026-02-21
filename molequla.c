@@ -5521,7 +5521,12 @@ int main(int argc, char **argv) {
 
         /* Consciousness: overthinkg rings (Feature 3) */
         /* "Let me re-read what I just said to strengthen my patterns." */
-        if (warmed_up && CFG.overthinkc_rounds > 0 && answer && strlen(answer) > 3) {
+        /* Only activate at final growth stage — during ontogenesis, dimension changes
+         * between growth and overthinkc_rings cause segfaults. At final stage, no more
+         * growth is possible so the race condition is eliminated. */
+        int final_stage_c = CFG.n_growth_stages - 1;
+        if (warmed_up && CFG.overthinkc_rounds > 0 && answer && strlen(answer) > 3
+            && gpt_current_growth_stage(model) >= final_stage_c) {
             pthread_mutex_lock(&model->mu);
             /* Snapshot dimensions before calling overthinkc_rings.
              * If ontogenesis changed the model between answer generation and now,

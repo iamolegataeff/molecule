@@ -5566,17 +5566,19 @@ func main() {
 
 		// Consciousness: overthinkg rings (Feature 3)
 		// "Let me re-read what I just said to strengthen my patterns."
-		if CFG.OverthinkcRounds > 0 && len(answer) > 3 {
+		// Only activate at final growth stage — during ontogenesis the background
+		// goroutine races with MaybeGrowArchitecture dimension changes, causing panics.
+		// Once at final stage, no more growth is possible so no race condition.
+		finalStage := len(CFG.GrowthStages) - 1
+		if CFG.OverthinkcRounds > 0 && len(answer) > 3 && model.CurrentGrowthStage() >= finalStage {
 			go func(text string, snapEmbd int) {
 				defer func() {
 					if r := recover(); r != nil {
-						// Ontogenesis may have changed model dimensions between goroutine
-						// creation and execution. This is non-critical — skip silently.
+						// Safety net — should not trigger at final stage, but just in case.
 					}
 				}()
 				model.mu.Lock()
 				defer model.mu.Unlock()
-				// Skip if model grew since this goroutine was created
 				if model.NEmbd != snapEmbd {
 					return
 				}
