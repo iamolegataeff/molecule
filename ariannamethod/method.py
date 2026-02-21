@@ -234,19 +234,45 @@ class Method:
 
         # Push into C METHOD operator
         if self.lib is not None:
-            self.lib.am_method_clear()
+            # Pre-compute gamma vectors and mean for coherence
+            gammas = {}
             for o in self.organisms:
-                # Compute gamma magnitude from blob
-                gamma_mag = 0.0
-                gamma_cos = 0.0
                 if o.gamma_direction and len(o.gamma_direction) > 0:
                     try:
                         arr = np.frombuffer(o.gamma_direction, dtype=np.float64)
-                        gamma_mag = float(np.linalg.norm(arr))
+                        norm = np.linalg.norm(arr)
+                        if norm > 1e-12:
+                            gammas[o.id] = arr / norm
                     except Exception:
                         pass
+
+            # Compute mean gamma direction
+            if len(gammas) >= 2:
+                vecs = list(gammas.values())
+                min_len = min(len(v) for v in vecs)
+                mean_gamma = np.mean([v[:min_len] for v in vecs], axis=0)
+                mean_norm = np.linalg.norm(mean_gamma)
+                if mean_norm > 1e-12:
+                    mean_gamma /= mean_norm
+                else:
+                    mean_gamma = None
+            else:
+                mean_gamma = None
+
+            self.lib.am_method_clear()
+            for o in self.organisms:
+                gamma_mag = 0.0
+                gamma_cos = 0.0
+                if o.id in gammas:
+                    g = gammas[o.id]
+                    gamma_mag = float(np.linalg.norm(g))  # ~1.0 (normalized)
+                    if mean_gamma is not None:
+                        min_len = min(len(g), len(mean_gamma))
+                        gamma_cos = float(np.dot(g[:min_len], mean_gamma[:min_len]))
+
+                oid = hash(o.id) & 0x7FFFFFFF if isinstance(o.id, str) else int(o.id)
                 self.lib.am_method_push_organism(
-                    o.id,
+                    oid,
                     ctypes.c_float(o.entropy),
                     ctypes.c_float(o.syntropy),
                     ctypes.c_float(gamma_mag),
