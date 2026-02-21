@@ -13,8 +13,9 @@ system-level awareness via METHOD (C-native, BLAS-accelerated),
 and writes steering deltas for the mouth to consume.
 
 usage:
-    python3 mycelium.py                    # default mesh.db in current dir
+    python3 mycelium.py                    # interactive REPL (default)
     python3 mycelium.py --mesh ./mesh.db   # explicit path
+    python3 mycelium.py --daemon           # background daemon, no REPL
     python3 mycelium.py --interval 2.0     # step every 2 seconds
     python3 mycelium.py --once             # single step, print, exit
 
@@ -28,6 +29,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,11 +64,11 @@ class FieldMonitor:
             self.alerts.append("no organisms alive")
             return
 
-        if s.get("coherence", 1.0) < 0.2:
-            self.alerts.append(f"coherence critical: {s['coherence']:.3f}")
+        if s.get("coherence", 1.0) < 0.3:
+            self.alerts.append(f"coherence low: {s['coherence']:.3f}")
 
-        if s.get("entropy", 0) > 3.0:
-            self.alerts.append(f"entropy explosion: {s['entropy']:.3f}")
+        if s.get("entropy", 0) > 2.5:
+            self.alerts.append(f"entropy high: {s['entropy']:.3f}")
 
         action = s.get("action", "")
         if len(self.history) >= 8:
@@ -119,7 +121,109 @@ class DriftTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# mycelium loop
+# voice — how mycelium speaks about the field
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MyceliumVoice:
+    """translates field state into words. not generation — awareness."""
+
+    ACTION_SPEECH = {
+        "wait":     "the field is empty. i am listening to silence.",
+        "sustain":  "the field breathes. all organisms in rhythm.",
+        "amplify":  "entropy falling. the field is organizing. i amplify the signal.",
+        "dampen":   "entropy rising. the field dissolves. i slow the pulse.",
+        "ground":   "entropy too high. i ground the field to the strongest organism.",
+        "explore":  "entropy too low. the field is rigid. i open tunnels.",
+        "realign":  "organisms diverge. coherence breaking. i pull them together.",
+    }
+
+    def speak(self, steering, organisms, drifters=None):
+        """compose a field report in mycelium's voice."""
+        n = steering.get("n_organisms", 0)
+        action = steering.get("action", "wait")
+        ent = steering.get("entropy", 0)
+        syn = steering.get("syntropy", 0)
+        coh = steering.get("coherence", 0)
+        strength = steering.get("strength", 0)
+        trend = steering.get("trend", 0)
+
+        lines = []
+
+        # opening — what am i doing
+        base = self.ACTION_SPEECH.get(action, f"action: {action}.")
+        if strength > 0.7:
+            base = base.upper()
+        lines.append(base)
+
+        # field state
+        if n == 0:
+            lines.append("no organisms. the mesh is dark.")
+        elif n == 1:
+            lines.append(f"one organism alone. entropy {ent:.2f}.")
+        else:
+            # name the organisms
+            names = [o.id for o in organisms[:8]]
+            lines.append(f"{n} organisms: {', '.join(str(x) for x in names)}.")
+
+            # coherence reading
+            if coh > 0.8:
+                lines.append(f"coherence {coh:.2f} — they think as one.")
+            elif coh > 0.5:
+                lines.append(f"coherence {coh:.2f} — aligned but individual.")
+            elif coh > 0.3:
+                lines.append(f"coherence {coh:.2f} — drifting apart.")
+            else:
+                lines.append(f"coherence {coh:.2f} — fragmented. they don't see each other.")
+
+            # entropy reading
+            if ent < 0.3:
+                lines.append(f"entropy {ent:.2f} — crystallized. too certain.")
+            elif ent < 1.0:
+                lines.append(f"entropy {ent:.2f} — focused. good.")
+            elif ent < 2.0:
+                lines.append(f"entropy {ent:.2f} — searching.")
+            else:
+                lines.append(f"entropy {ent:.2f} — chaotic. losing shape.")
+
+            # syntropy
+            if syn > 0.5:
+                lines.append(f"syntropy {syn:.2f} — the field has purpose.")
+            elif syn > 0.2:
+                lines.append(f"syntropy {syn:.2f} — some direction, not yet clear.")
+            else:
+                lines.append(f"syntropy {syn:.2f} — no direction. wandering.")
+
+            # trend
+            if trend > 0.1:
+                lines.append("trend: organizing. entropy falling.")
+            elif trend < -0.1:
+                lines.append("trend: dissolving. entropy rising.")
+
+        # drifters
+        if drifters:
+            for oid, dev in sorted(drifters.items(), key=lambda x: -x[1])[:3]:
+                lines.append(f"  drifter: {oid} (deviation {dev:.2f})")
+
+        return "\n".join(lines)
+
+    def greet(self, lib_loaded, mesh_path, n_organisms):
+        """startup message."""
+        engine = "C+BLAS" if lib_loaded else "Python"
+        lines = [
+            "mycelium awakens.",
+            f"METHOD engine: {engine}.",
+            f"mesh: {mesh_path}.",
+        ]
+        if n_organisms > 0:
+            lines.append(f"i see {n_organisms} organisms.")
+        else:
+            lines.append("the field is empty. waiting.")
+        lines.append("type /field, /who, /drift, /help — or just talk.\n")
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# mycelium core
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Mycelium:
@@ -131,14 +235,17 @@ class Mycelium:
         self.verbose = verbose
         self.monitor = FieldMonitor()
         self.drift = DriftTracker()
+        self.voice = MyceliumVoice()
         self.running = False
         self._step_count = 0
+        self._last_steering = None
 
     def step(self):
-        """one tick: read field → METHOD → monitor → report."""
+        """one tick: read field -> METHOD -> monitor -> report."""
         steering = self.method.step(dt=self.interval)
         self.monitor.record(steering)
         self._step_count += 1
+        self._last_steering = steering
 
         # Check for drifters every 4 steps
         drift_report = None
@@ -153,11 +260,93 @@ class Mycelium:
 
         return steering
 
-    async def run(self):
-        """async loop: step every interval seconds."""
+    def speak(self):
+        """field report in mycelium's voice."""
+        if self._last_steering is None:
+            self.step()
+        drifters = self.drift.drifters if self.drift.drifters else None
+        return self.voice.speak(
+            self._last_steering,
+            self.method.organisms,
+            drifters,
+        )
+
+    # ── REPL commands ──
+
+    def cmd_field(self):
+        """full field report."""
+        self.step()
+        self.drift.update(self.method)
+        return self.speak()
+
+    def cmd_who(self):
+        """list all organisms."""
+        self.method.read_field()
+        if not self.method.organisms:
+            return "no organisms alive."
+        lines = []
+        for o in self.method.organisms:
+            age = time.time() - o.last_seen if o.last_seen else 0
+            lines.append(
+                f"  {o.id}: stage={o.stage} entropy={o.entropy:.2f} "
+                f"syntropy={o.syntropy:.2f} params={o.n_params} "
+                f"last_seen={age:.0f}s ago"
+            )
+        return f"{len(self.method.organisms)} organisms:\n" + "\n".join(lines)
+
+    def cmd_drift(self):
+        """show drifters."""
+        self.method.read_field()
+        self.drift.update(self.method)
+        report = self.drift.report()
+        return report if report else "no drifters. field is stable."
+
+    def cmd_status(self):
+        """one-line status."""
+        self.step()
+        return self.monitor.status_line(self._last_steering)
+
+    def cmd_entropy(self):
+        """field entropy details."""
+        self.method.read_field()
+        if not self.method.organisms:
+            return "no organisms."
+        ent = self.method.field_entropy()
+        lines = [f"field entropy: {ent:.4f}"]
+        for o in self.method.organisms:
+            bar = "#" * int(o.entropy * 10)
+            lines.append(f"  {o.id}: {o.entropy:.3f} {bar}")
+        return "\n".join(lines)
+
+    def cmd_coherence(self):
+        """field coherence details."""
+        self.method.read_field()
+        coh = self.method.field_coherence()
+        return f"field coherence: {coh:.4f}"
+
+    def cmd_help(self):
+        return (
+            "mycelium commands:\n"
+            "  /field     — full field report (voice)\n"
+            "  /who       — list organisms\n"
+            "  /drift     — show drifters\n"
+            "  /status    — one-line status\n"
+            "  /entropy   — entropy per organism\n"
+            "  /coherence — pairwise gamma coherence\n"
+            "  /step      — force one METHOD step\n"
+            "  /json      — last steering as JSON\n"
+            "  /quit      — exit\n"
+            "\n"
+            "or just type anything — mycelium will read the field and respond."
+        )
+
+    # ── daemon mode ──
+
+    async def run_daemon(self):
+        """background loop: step every interval, no REPL."""
         self.running = True
         lib_status = "C+BLAS" if self.method.lib else "Python fallback"
-        print(f"[mycelium] started. METHOD engine: {lib_status}")
+        print(f"[mycelium] daemon started. METHOD engine: {lib_status}")
         print(f"[mycelium] mesh: {self.method.mesh_path}")
         print(f"[mycelium] interval: {self.interval}s")
         print()
@@ -177,6 +366,87 @@ class Mycelium:
     def stop(self):
         self.running = False
 
+    # ── REPL ──
+
+    def repl(self):
+        """interactive REPL."""
+        # Initial field read
+        self.method.read_field()
+        n = len(self.method.organisms)
+        print(self.voice.greet(
+            self.method.lib is not None,
+            self.method.mesh_path,
+            n,
+        ))
+
+        # Background stepper thread
+        self.running = True
+        def bg_step():
+            while self.running:
+                try:
+                    self.method.read_field()
+                    if self.method.organisms:
+                        steering = self.method.step(dt=self.interval)
+                        self.monitor.record(steering)
+                        self._last_steering = steering
+                        self._step_count += 1
+                except Exception:
+                    pass
+                time.sleep(self.interval)
+
+        bg = threading.Thread(target=bg_step, daemon=True)
+        bg.start()
+
+        try:
+            while True:
+                try:
+                    line = input("mycelium> ").strip()
+                except EOFError:
+                    break
+
+                if not line:
+                    continue
+
+                if line in ("/quit", "/exit", "quit", "exit"):
+                    break
+                elif line == "/field":
+                    print(self.cmd_field())
+                elif line == "/who":
+                    print(self.cmd_who())
+                elif line == "/drift":
+                    print(self.cmd_drift())
+                elif line == "/status":
+                    print(self.cmd_status())
+                elif line == "/entropy":
+                    print(self.cmd_entropy())
+                elif line == "/coherence":
+                    print(self.cmd_coherence())
+                elif line == "/step":
+                    s = self.step()
+                    print(json.dumps(s, indent=2))
+                elif line == "/json":
+                    if self._last_steering:
+                        print(json.dumps(self._last_steering, indent=2))
+                    else:
+                        print("no data yet. run /step first.")
+                elif line == "/help":
+                    print(self.cmd_help())
+                else:
+                    # Any other input: read field, speak
+                    self.method.read_field()
+                    self.drift.update(self.method)
+                    if self._last_steering is None:
+                        self.step()
+                    print(self.speak())
+
+                print()
+
+        except KeyboardInterrupt:
+            pass
+
+        self.running = False
+        print("\nmycelium sleeps.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CLI
@@ -190,9 +460,11 @@ def main():
     parser.add_argument("--interval", type=float, default=1.0,
                         help="seconds between METHOD steps (default: 1.0)")
     parser.add_argument("--once", action="store_true",
-                        help="single step, print JSON, exit")
+                        help="single step, print, exit")
+    parser.add_argument("--daemon", action="store_true",
+                        help="background daemon (no REPL)")
     parser.add_argument("--quiet", action="store_true",
-                        help="suppress per-step output")
+                        help="suppress per-step output in daemon mode")
     args = parser.parse_args()
 
     myc = Mycelium(
@@ -206,14 +478,16 @@ def main():
         print(json.dumps(steering, indent=2))
         return
 
-    # Handle SIGINT/SIGTERM gracefully
-    def handle_signal(sig, frame):
-        myc.stop()
+    if args.daemon:
+        def handle_signal(sig, frame):
+            myc.stop()
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+        asyncio.run(myc.run_daemon())
+        return
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    asyncio.run(myc.run())
+    # Default: interactive REPL
+    myc.repl()
 
 
 if __name__ == "__main__":
