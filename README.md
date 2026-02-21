@@ -144,8 +144,7 @@ H: and the lid the bad a data s a built my you?
 it through the fields dating work.
 ```
 
-Yes, it's fragmented. It's a 10K-param embryo that just grew to 28K params in real time.
-But look closely: "What is the..." patterns, numbers ("six", "hundred", "forty"),
+It's a 10K-param embryo that just grew to 28K params in real time. Look closely: "What is the..." patterns, numbers ("six", "hundred", "forty"),
 the word "pattern" emerging, even "H:" as a learned token. It's learning QA structure.
 Feed it more corpus and watch it grow through 6 stages to 10M params.
 
@@ -501,7 +500,7 @@ Then it decides how to adjust learning:
 | Field deviation too low | **explore** | 1.3× | Parroting — push out |
 | Purpose opposes gamma | **realign** | 0.5× | Identity crisis — hard slow |
 
-This is not heuristics — it's **mathematical introspection**. The organism measures its own entropy trend, computes how far it's drifted from corpus physics, measures whether its current learning direction aligns with its accumulated identity, and adjusts. Gamma is memory. Purpose is intention. Syntropy is the arrow.
+This is **mathematical introspection**. The organism measures its own entropy trend, computes how far it's drifted from corpus physics, measures whether its current learning direction aligns with its accumulated identity, and adjusts. Gamma is memory. Purpose is intention. Syntropy is the arrow.
 
 Every decision is logged to the syntropy_log table with full metrics.
 
