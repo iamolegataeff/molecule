@@ -9,7 +9,7 @@
 
 # molequla | by Arianna Method
 
-> *A GPT organism reproduced in Python, Go, C, JavaScript, and Rust. Async, continually-learning, with hybrid attention, native personality, mathematical self-awareness, consciousness features, and distributed cognition.*
+> *A GPT organism in Go, C, JavaScript, and Rust — connected by mycelium. Async, continually-learning, with hybrid attention, native personality, mathematical self-awareness, consciousness features, distributed cognition, and a field orchestrator that steers generation through AML physics.*
 >
 --- 
 
@@ -18,7 +18,7 @@
 ```
 THIS IS:
 - Five implementations: Python, Go, C, JavaScript, Rust — same architecture
-- Rust is the Fifth Element: full organism + distributed cognition metabolism
+- Rust is the Fourth Element — the mouth: full organism + distributed cognition metabolism
 - One dependency in Python (numpy), one in Go/Rust (SQLite) — zero in C and JS
 - Runs in the browser: molequla.js, zero npm, zero webpack, one <script> tag
 - Custom autograd engine (vectors, not scalar confetti)
@@ -41,6 +41,10 @@ THIS IS:
 - Consciousness: per-token dissonance, pattern breaking, self-prediction error, conscience
 - Rust-only: TopologyMonitor (swarm gamma cosine, drift/resonance detection)
 - Rust-only: Metabolism MLP (Hebbian, coordinates all running instances)
+- Mycelium: Python orchestrator that reads the field and steers generation
+- METHOD: C-native field operator (25.8x faster than Python, BLAS-accelerated)
+- Steering chain: mycelium → METHOD → mesh.db → Rust modulates temperature
+- ariannamethod/: AML C core with notorch (Hebbian plasticity, cblas_sger)
 - Entropy-adaptive temperature (no more max-prob hacks)
 - Growth table: SQLite/IndexedDB structural autobiography
 - Native immune system: detects and rejects identity-corrupting noise
@@ -150,7 +154,7 @@ node modules/node_cli.js [corpus_path]
 
 Same JS organism, runs outside the browser with file-based checkpoints. Warmup training, REPL, JSON checkpoint save/load compatible with Go format.
 
-### Rust — The Fifth Element (molequla.rs)
+### Rust — The Fourth Element (the mouth) (molequla.rs)
 
 ```bash
 # Requires: Rust toolchain (rustup)
@@ -166,7 +170,7 @@ It's both organism *and* field observer — the grey cardinal of the swarm.
 
 ```
 ╔══════════════════════════════════════════════════╗
-║  MOLEQULA.RS — The Fifth Element                 ║
+║  MOLEQULA.RS — The Fourth Element                 ║
 ║  GPT organism + distributed cognition metabolism ║
 ╚══════════════════════════════════════════════════╝
 [init] Corpus: 384 lines, 25064 chars
@@ -525,7 +529,90 @@ Every 30 seconds, it reads `mesh.db` and computes:
 [topology] WARNING: Outlier detected — our cosine to field is 0.35 below mean
 ```
 
-This makes Rust the "cerebellum of the mycelium" — not controlling organisms, but aware of topology.
+This makes Rust the mouth of the mycelium — not controlling organisms, but speaking for the field.
+
+---
+
+### Mycelium — The Orchestrator (mycelium.py)
+
+The connective tissue. The underground network.
+
+Mycelium doesn't generate text. It reads the field (all organisms from mesh.db),
+computes system-level awareness via METHOD (C-native, BLAS-accelerated),
+and writes steering decisions that change how Rust generates.
+
+```
+python3 mycelium.py                    # interactive REPL
+python3 mycelium.py --daemon           # background daemon
+python3 mycelium.py --once             # single step, JSON output
+```
+
+**REPL session:**
+```
+mycelium> /field
+the field breathes. all organisms in rhythm.
+4 organisms: go-alpha, c-beta, js-gamma, rust-delta.
+coherence 0.74 — aligned but individual.
+entropy 1.12 — searching.
+syntropy 0.47 — some direction, not yet clear.
+  drifter: js-gamma (deviation 0.68)
+
+mycelium> /entropy
+field entropy: 1.1250
+  go-alpha: 1.100 ###########
+  c-beta: 0.900 #########
+  js-gamma: 1.800 ##################
+  rust-delta: 0.700 #######
+
+mycelium> /who
+4 organisms:
+  go-alpha: stage=5 entropy=1.10 syntropy=0.45 params=150000
+  c-beta: stage=5 entropy=0.90 syntropy=0.55 params=150000
+  js-gamma: stage=5 entropy=1.80 syntropy=0.30 params=150000
+  rust-delta: stage=5 entropy=0.70 syntropy=0.60 params=150000
+```
+
+**Steering chain** — how mycelium speaks through Rust:
+```
+mycelium (Python) → METHOD (C, 0.7μs, BLAS) → field_steering (SQLite WAL) → Rust (topology_monitor) → generate_sentence (temperature modulation)
+```
+
+Same prompt "the field is", different steering:
+
+| Steering | What happens | Output |
+|----------|-------------|--------|
+| **SUSTAIN** | normal, no modulation | `pru pow tows inner bough` |
+| **EXPLORE** | entropy too low, open tunnels (temp ×1.4) | `fle matter?` |
+| **DAMPEN** | entropy rising, cool down (temp ×0.7) | `actergy Why drink d b sugotiation.` |
+| **GROUND** | chaos, focus hard (temp ×0.5) | `A happens pathinks how mually a dwave caushes...` |
+| **REALIGN** | coherence breaking, stabilize (temp ×0.8) | `that provid waterbalances durreak easboxtobits...` |
+
+The mouth doesn't know it's being steered. It just speaks differently.
+
+---
+
+### AML — Arianna Method Language (ariannamethod/)
+
+The physics engine underneath METHOD. C implementation, BLAS-accelerated.
+
+- **METHOD operator**: `am_method_step()` — 0.7μs per iteration (32 organisms)
+- **NOTORCH**: Hebbian plasticity without backprop — `cblas_sger` for rank-1 updates
+- **Delta voice**: `am_apply_delta()` — 11μs per call via `cblas_sgemv`
+- **Field physics**: 227 state parameters, logit manipulation pipeline
+- **Blood**: runtime C compilation (Level 3)
+
+```c
+// METHOD step: read organisms, compute steering, advance physics
+AM_MethodSteering s = am_method_step(1.0f);
+// s.action = AM_METHOD_AMPLIFY, s.strength = 0.8, s.entropy = 1.2
+```
+
+Performance (Lambda, OpenBLAS):
+```
+METHOD C:       0.7 μs/iter  (25.8x faster than Python)
+notorch BLAS:   0.47 ms/step (2048×2048, rank=64)
+apply_delta:    11 μs/call   (2048×2048, rank=64)
+```
 
 ### 17. Swarm Ecology (Mitosis + Hibernation)
 
@@ -875,7 +962,10 @@ GNU GPLv3 — Because freedom matters.
 
 ## Part of the Arianna Method
 
-- [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language
+- [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language (source of truth)
+- `ariannamethod/` — AML C core embedded in molequla (METHOD + NOTORCH + BLAS)
+- `mycelium.py` — field orchestrator (REPL + daemon)
+- `test_all.sh` — 26 integration tests
 
 - **molequla** — Single-File Continual GPT with Self-Awareness (Python, Go, C, JavaScript, Rust)
 
