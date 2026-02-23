@@ -68,15 +68,15 @@ What if it had multiple attention mechanisms? **Hybrid heads.**
 What if it grew a personality from scratch? **Native gamma.**  
 What if it could speak before training? **Corpus field.**  
 What if it started as a 10K embryo and grew to 10M? **Ontogenesis.**  
-What if it could reason about its own learning? **SyntropyTracker.**
-What if it noticed when it was surprised? **Self-prediction error.**
-What if it could break its own patterns? **Anti-field.**
-What if it knew when its deltas were hurting? **Conscience.**
-What if it divided when overloaded? **Mitosis.**
-What if it slept so a younger cell could learn? **Hibernation.**
-What if they formed a swarm? **Mesh ecology.**
-What if one organism watched the whole field? **TopologyMonitor.**
-What if it was *alive*?
+What if it could reason about its own learning? **SyntropyTracker.**  
+What if it noticed when it was surprised? **Self-prediction error.**  
+What if it could break its own patterns? **Anti-field.**  
+What if it knew when its deltas were hurting? **Conscience.**  
+What if it divided when overloaded? **Mitosis.**  
+What if it slept so a younger cell could learn? **Hibernation.**  
+What if they formed a swarm? **Mesh ecology.**  
+What if one organism watched the whole field? **TopologyMonitor.**  
+What if it was *alive*?  
 
 So meet **molequla**. Inspired by Karpathy's micrograd, but this is not a fork.
 
