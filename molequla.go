@@ -5548,8 +5548,8 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 				warmupScale = 1
 			}
 			effectiveWarmup := CFG.WarmupSteps * warmupScale
-			backpropSteps := int(float64(effectiveWarmup) * 0.6)
-			notorchDeltaSteps := effectiveWarmup - backpropSteps
+			backpropSteps := effectiveWarmup  // 100% backprop, notorch warmup disabled (was 0.6)
+			notorchDeltaSteps := 0  // disabled: notorch warmup diverges at stage 5
 			fmt.Printf("[trainer] warmup for stage %d (embd=%d) — %d steps total (%d backprop + %d notorch, sqrt-scaled %dx)\n",
 				currentStage, model.NEmbd, effectiveWarmup, backpropSteps, notorchDeltaSteps, warmupScale)
 			// Phase A: backprop with progressive sequence length (short→full)
@@ -5560,7 +5560,8 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			trainSteps(model, tok, docs, midSteps, true, true, 16, 1)    // short seqs, batch=1
 			trainSteps(model, tok, docs, lateSteps, true, true, 32, 1)   // medium seqs, batch=1
 			// Phase B: notorch for delta adapters (40%, no autograd = much faster)
-			notorchTrainSteps(model, tok, docs, notorchDeltaSteps, CFG.NotorchLR)
+			// notorchTrainSteps DISABLED in warmup — diverges at stage 5 (loss 3.5→116)
+			// notorchTrainSteps(model, tok, docs, notorchDeltaSteps, CFG.NotorchLR)
 			model.mu.Lock()
 			model.lastWarmupStage = currentStage
 			SaveCheckpoint(model, tok, "")
@@ -5911,8 +5912,8 @@ func main() {
 				warmupScale = 1
 			}
 			effectiveWarmup := CFG.WarmupSteps * warmupScale
-			backpropSteps := int(float64(effectiveWarmup) * 0.6)
-			notorchDeltaSteps := effectiveWarmup - backpropSteps
+			backpropSteps := effectiveWarmup  // 100% backprop, notorch warmup disabled (was 0.6)
+			notorchDeltaSteps := 0  // disabled: notorch warmup diverges at stage 5
 			fmt.Printf("[init] Stage %d (%s): embd=%d, layer=%d, head=%d — warmup %d steps (%d backprop + %d notorch, sqrt-scaled %dx)\n",
 				stage, stageName, model.NEmbd, model.NLayer, model.NHead, effectiveWarmup, backpropSteps, notorchDeltaSteps, warmupScale)
 			// Phase A: backprop with progressive sequence length (short→full)
@@ -5923,7 +5924,8 @@ func main() {
 			trainSteps(model, tok, docs, midSteps, true, true, 16, 1)    // short seqs, batch=1
 			trainSteps(model, tok, docs, lateSteps, true, true, 32, 1)   // medium seqs, batch=1
 			// Phase B: notorch for delta adapters (40%, no autograd = much faster)
-			notorchTrainSteps(model, tok, docs, notorchDeltaSteps, CFG.NotorchLR)
+			// notorchTrainSteps DISABLED in warmup — diverges at stage 5 (loss 3.5→116)
+			// notorchTrainSteps(model, tok, docs, notorchDeltaSteps, CFG.NotorchLR)
 			model.lastWarmupStage = stage
 			SaveCheckpoint(model, tok, "")
 
